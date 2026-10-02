@@ -299,14 +299,7 @@ async fn resumable_backfill_ttl_backup_and_delete() {
     lifecycle_contract(e, clock).await;
 }
 
-#[tokio::test]
-async fn oversized_backup_fails_without_publishing_partial_snapshot() {
-    let e = TikvEngine::new(
-        Arc::new(MemoryStore::default()),
-        "backup_limit",
-        "us-east-1",
-    )
-    .unwrap();
+async fn large_backup_contract(e: TikvEngine) {
     let account = "111111111111";
     TikvCatalog::new(e.clone())
         .create_account(account, "backup")
@@ -329,8 +322,25 @@ async fn oversized_backup_fails_without_publishing_partial_snapshot() {
             .await
             .unwrap();
     }
-    assert!(matches!(e.create_backup(account, "large", "too-big").await,
-        Err(StorageError::Validation(message)) if message.contains("4 MiB")));
+    let backup = e
+        .create_backup(account, "large", "large-snapshot")
+        .await
+        .unwrap();
+    assert!(backup.backup_size_bytes > 4 * 1024 * 1024);
+    let restored = e
+        .restore_table_from_backup(account, "restored-large", &backup.backup_arn)
+        .await
+        .unwrap();
+    assert_eq!(restored.item_count, 12);
+    let ri = e.table_key_info(account, "restored-large").await.unwrap();
+    for i in 0..12 {
+        let key = Item::from_iter([("pk".into(), AttributeValue::S(i.to_string()))]);
+        assert_eq!(
+            e.get_item(&info, &key).await.unwrap(),
+            e.get_item(&ri, &key).await.unwrap()
+        );
+    }
+    e.delete_backup(account, &backup.backup_arn).await.unwrap();
     assert!(e.list_backups(account, None).await.unwrap().is_empty());
     assert_eq!(
         e.scan(&info, Some(100), None, None, None, None)
@@ -340,6 +350,25 @@ async fn oversized_backup_fails_without_publishing_partial_snapshot() {
             .len(),
         12
     );
+}
+
+#[tokio::test]
+async fn backup_exceeds_four_mib() {
+    large_backup_contract(
+        TikvEngine::new(
+            Arc::new(MemoryStore::default()),
+            "backup-large",
+            "us-east-1",
+        )
+        .unwrap(),
+    )
+    .await;
+}
+#[cfg(feature = "client")]
+#[tokio::test]
+#[ignore = "requires dedicated TiKV/PD cluster; set TIKV_PD_ENDPOINTS"]
+async fn real_large_backup_contract() {
+    common::real_contract(large_backup_contract).await;
 }
 
 #[cfg(feature = "client")]

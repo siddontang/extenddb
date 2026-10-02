@@ -86,7 +86,7 @@ counted as cluster validation. Offline unit/contract tests need no TiKV process.
 
 `verify` checks backend connectivity and catalog counts. `catalog-check` is a
 PostgreSQL physical-table diagnostic and explicitly refuses this backend.
-`migrate` upgrades catalog schema 1 to 2; stop all namespace writers before
+`migrate` upgrades catalog schemas 1/2 to 3; stop all namespace writers before
 upgrading, then restart with the new binary. Inline IAM accounts convert on their
 next management edit. Mixed-version writers and direct downgrade are unsupported; there is no PostgreSQL-to-TiKV conversion.
 
@@ -104,7 +104,7 @@ after failure; it is not a single atomic cluster operation.
 
 Read the [backend limits](../crates/storage-tikv/README.md#scope-and-deployment-limits)
 before planning a rollout. Vector search uses exact partition scans; PITR remains unsupported. Backups are
-atomic but limited to 4 MiB encoded snapshots; IAM has no account-wide size cap; individual records are bounded at 4 MiB. GSIs are synchronous. Existing data needs an explicit migration plan.
+streamed from a GC-protected snapshot with atomic publication; IAM has no account-wide size cap; individual records are bounded at 4 MiB. GSIs are synchronous. Existing data needs an explicit migration plan.
 
 TiKV's old MVCC versions require coordinated garbage collection. ExtendDB does
 not advance the cluster-wide GC safepoint because it cannot account for other

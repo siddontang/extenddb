@@ -193,6 +193,7 @@ impl TikvEngine {
             })
             .await?;
         self.complete_vector_builds().await?;
+        self.reap_staging().await?;
         Ok(transitions)
     }
     /// Delete at most 64 expired candidates per table, with an in-transaction

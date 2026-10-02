@@ -1,28 +1,43 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Atomic, account-scoped on-demand snapshots for small tables.
+//! Account-scoped streaming snapshots and atomic publication.
 //!
-//! The current implementation deliberately caps the encoded backup at 4 MiB.
-//! It refuses larger tables before writing anything, rather than publishing an
-//! inconsistent chunked snapshot. Restore publishes a fresh table generation,
-//! rebuilt indexes and all items in one commit. Production bulk backup belongs
-//! in a future pinned-timestamp/export implementation. PITR is not advertised.
+//! One MVCC snapshot feeds immutable per-item chunks. A small manifest becomes
+//! visible only when every chunk is durable. Restores rebuild an unreachable
+//! generation and atomically publish it. Leased staging prefixes make failures,
+//! cancellation and unknown commit outcomes reclaimable without deleting a
+//! successfully published result. Legacy inline backups remain readable.
+mod restore;
+mod snapshot;
 use crate::{TikvEngine, index, kv, table::Table};
 use extenddb_core::types::*;
 use extenddb_storage::{BackupEngine, error::StorageError};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-const MAX_BACKUP: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Backup {
     #[serde(default)]
     account_generation: String,
     table: Table,
     details: BackupDetails,
+    #[serde(default)]
     items: Vec<Item>,
+    #[serde(default)]
+    data_id: Option<String>,
+    #[serde(default)]
+    item_count: u64,
 }
 impl Backup {
+    fn count(&self) -> u64 {
+        if self.data_id.is_some() {
+            self.item_count
+        } else {
+            self.items.len() as u64
+        }
+    }
+
     fn description(&self) -> BackupDescription {
         let d = &self.table.description;
         BackupDescription {
@@ -32,7 +47,7 @@ impl Backup {
                 table_id: d.table_id.clone(),
                 table_arn: d.table_arn.clone(),
                 key_schema: d.key_schema.clone(),
-                item_count: self.items.len() as i64,
+                item_count: self.count() as i64,
                 table_size_bytes: self.details.backup_size_bytes,
                 billing_mode: d.billing_mode_summary.as_ref().map(|b| {
                     match b.billing_mode {
@@ -94,82 +109,77 @@ impl BackupEngine for TikvEngine {
             backup_name.to_owned(),
         );
         Box::pin(async move {
-            e.db.run(|tx| {
-                let (e, a, n, b) = (e.clone(), a.clone(), n.clone(), b.clone());
-                Box::pin(async move {
-                    let t = e.table_by_name(tx, &a, &n).await?;
-                    if t.description.table_status != TableStatus::Active
-                        || t.indexes.iter().any(|i| i.cursor.is_some())
-                        || t.vectors.iter().any(|v| v.backfilling.is_some())
-                    {
-                        return Err(StorageError::TableNotActive(n));
+            let mut reader = snapshot::Reader::open(&e, &a, &n).await?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let stage = crate::staging::Stage::begin(&e, e.key(&["backup_data", &id])).await?;
+            let result = async {
+                let mut count = 0u64;
+                let mut size = 0i64;
+                loop {
+                    let items = reader.next().await?;
+                    if items.is_empty() {
+                        break;
                     }
-                    let p = e.item_prefix(&t.description.table_id);
-                    let mut start = p.clone();
-                    let mut items = vec![];
-                    let mut bytes = 0;
-                    loop {
-                        let rows = tx
-                            .scan(start.clone(), crate::codec::prefix_end(&p), 64, false)
-                            .await
-                            .map_err(kv::storage_error)?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        for (k, v) in &rows {
-                            bytes += v.len();
-                            if bytes > MAX_BACKUP {
-                                return Err(StorageError::Validation(
-                                    "TiKV on-demand backup exceeds the 4 MiB snapshot limit".into(),
-                                ));
-                            }
-                            items.push(kv::decode::<Item>(v)?);
-                            start = k.clone();
-                            start.push(0);
-                        }
-                        if rows.len() < 64 {
-                            break;
-                        }
+                    for item in items {
+                        let key = e.key(&["backup_data", &id, &format!("{count:020}")]);
+                        e.db.run(|tx| {
+                            let stage = stage.clone();
+                            let key = key.clone();
+                            let item = item.clone();
+                            Box::pin(async move {
+                                stage.touch(tx).await?;
+                                kv::put(tx, key, &item).await
+                            })
+                        })
+                        .await?;
+                        count += 1;
+                        size += item_size_bytes(&item) as i64;
                     }
-                    let size = items.iter().map(item_size_bytes).sum::<usize>();
-                    let details = BackupDetails {
-                        backup_arn: format!(
-                            "{}/backup/{}",
-                            t.description.table_arn,
-                            uuid::Uuid::new_v4()
-                        ),
-                        backup_name: b,
-                        backup_status: "AVAILABLE".into(),
-                        backup_type: "USER".into(),
-                        backup_size_bytes: size as i64,
-                        backup_creation_date_time: e.clock.now_ms() as f64 / 1000.,
-                    };
-                    let backup = Backup {
-                        account_generation: kv::get::<crate::catalog::Account>(
+                }
+                let details = BackupDetails {
+                    backup_arn: format!("{}/backup/{}", reader.table.description.table_arn, id),
+                    backup_name: b,
+                    backup_status: "AVAILABLE".into(),
+                    backup_type: "USER".into(),
+                    backup_size_bytes: size,
+                    backup_creation_date_time: e.clock.now_ms() as f64 / 1000.,
+                };
+                let backup = Backup {
+                    account_generation: reader.account_generation,
+                    table: reader.table,
+                    details: details.clone(),
+                    items: vec![],
+                    data_id: Some(id),
+                    item_count: count,
+                };
+                e.db.run(|tx| {
+                    let e = e.clone();
+                    let a = a.clone();
+                    let stage = stage.clone();
+                    let backup = backup.clone();
+                    Box::pin(async move {
+                        let owner =
+                            kv::get::<crate::catalog::Account>(tx, e.key(&["account", &a])).await?;
+                        if owner.is_none_or(|o| o.generation != backup.account_generation) {
+                            return Err(missing());
+                        }
+                        stage.publish(tx).await?;
+                        kv::put(
                             tx,
-                            e.key(&["account", &a]),
+                            e.key(&["backup", &a, &backup.details.backup_arn]),
+                            &backup,
                         )
-                        .await?
-                        .ok_or_else(missing)?
-                        .generation,
-                        table: t,
-                        details: details.clone(),
-                        items,
-                    };
-                    if serde_json::to_vec(&backup)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?
-                        .len()
-                        > MAX_BACKUP
-                    {
-                        return Err(StorageError::Validation(
-                            "TiKV on-demand backup exceeds the 4 MiB snapshot limit".into(),
-                        ));
-                    }
-                    kv::put(tx, e.key(&["backup", &a, &details.backup_arn]), &backup).await?;
-                    Ok(details)
+                        .await
+                    })
                 })
-            })
-            .await
+                .await?;
+                Ok(details)
+            }
+            .await;
+            if result.is_err() {
+                let _ = stage.abandon().await;
+            }
+            result
         })
     }
     fn describe_backup(
@@ -231,9 +241,17 @@ impl BackupEngine for TikvEngine {
             e.db.run(|tx| {
                 let (e, a, b) = (e.clone(), a.clone(), b.clone());
                 Box::pin(async move {
-                    let desc = e.backup(tx, &a, &b).await?.description();
+                    let backup = e.backup(tx, &a, &b).await?;
+                    if let Some(id) = &backup.data_id {
+                        kv::put(
+                            tx,
+                            e.key(&["garbage", "backup", id]),
+                            &e.key(&["backup_data", id]),
+                        )
+                        .await?;
+                    }
                     kv::delete(tx, e.key(&["backup", &a, &b])).await?;
-                    Ok(desc)
+                    Ok(backup.description())
                 })
             })
             .await
@@ -252,75 +270,33 @@ impl BackupEngine for TikvEngine {
             arn.to_owned(),
         );
         Box::pin(async move {
-            e.db.run(|tx| {
-                let (e, a, n, b) = (e.clone(), a.clone(), n.clone(), b.clone());
-                Box::pin(async move {
-                    let backup = e.backup(tx, &a, &b).await?;
-                    if kv::get::<crate::catalog::Account>(tx, e.key(&["account", &a]))
-                        .await?
-                        .is_none()
-                    {
-                        return Err(StorageError::Validation("Account does not exist".into()));
+            let mut tx = e.db.snapshot().await?;
+            let backup = e.backup(tx.as_mut(), &a, &b).await?;
+            let mut writer =
+                restore::Writer::begin(&e, &backup.table, &n, backup.account_generation.clone())
+                    .await?;
+            let result = async {
+                if let Some(id) = &backup.data_id {
+                    for i in 0..backup.count() {
+                        let item: Item = tx
+                            .get_snapshot(e.key(&["backup_data", id, &format!("{i:020}")]))
+                            .await
+                            .map_err(kv::storage_error)?
+                            .map(|v| kv::decode(&v))
+                            .transpose()?
+                            .ok_or_else(|| StorageError::Internal("Backup chunk missing".into()))?;
+                        writer.write(&[item]).await?;
                     }
-                    let map = e.key(&["tables", &a, &n]);
-                    if kv::get::<String>(tx, map.clone()).await?.is_some() {
-                        return Err(StorageError::TableAlreadyExists(n));
-                    }
-                    let mut t = backup.table;
-                    t.description.table_id = uuid::Uuid::new_v4().to_string();
-                    t.description.table_name = n;
-                    t.description.table_arn =
-                        extenddb_storage::util::table_arn(&e.region, &a, &t.description.table_name);
-                    t.description.creation_date_time = e.clock.now_ms() as f64 / 1000.;
-                    t.description.table_status = TableStatus::Active;
-                    t.description.latest_stream_arn = None;
-                    t.description.latest_stream_label = None;
-                    t.description.stream_specification = None;
-                    t.description.deletion_protection_enabled = false;
-                    t.ttl_attribute = None;
-                    t.ttl_ready = false;
-                    t.ttl_cursor = None;
-                    t.ttl_generation = String::new();
-                    for i in &mut t.indexes {
-                        i.id = uuid::Uuid::new_v4().to_string();
-                        i.cursor = None;
-                    }
-                    for v in &mut t.vectors {
-                        v.id = uuid::Uuid::new_v4().to_string();
-                        v.backfilling = None;
-                        v.complete = true;
-                        v.cursor.clear();
-                    }
-                    t.description.item_count = backup.items.len() as i64;
-                    t.description.table_size_bytes = backup.details.backup_size_bytes;
-                    let info = t.key_info();
-                    for item in backup.items {
-                        for v in &t.vectors {
-                            crate::vector::apply(&e, tx, &t, v, None, Some(&item)).await?;
-                        }
-                        kv::put(tx, e.item_key(&info, &item)?, &item).await?;
-                        for i in &t.indexes {
-                            index::apply(
-                                &e,
-                                tx,
-                                &info.table_id,
-                                i,
-                                &info.key_schema,
-                                None,
-                                Some(&item),
-                            )
-                            .await?;
-                        }
-                    }
-                    let guard = e.key(&["account_tables", &a]);
-                    let count: u64 = kv::get(tx, guard.clone()).await?.unwrap_or(0);
-                    kv::put(tx, guard, &(count + 1)).await?;
-                    kv::put(tx, map, &info.table_id).await?;
-                    e.save_table(tx, &t).await?;
-                    Ok(t.describe())
-                })
-            })
-            .await
+                } else {
+                    writer.write(&backup.items).await?;
+                }
+                writer.finish().await
+            }
+            .await;
+            if result.is_err() {
+                writer.abandon().await;
+            }
+            result
         })
     }
     fn describe_continuous_backups(
@@ -373,5 +349,101 @@ impl BackupEngine for TikvEngine {
                 "TiKV point-in-time recovery".into(),
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{catalog::TikvCatalog, kv::memory::MemoryStore};
+    use extenddb_core::expression::ExpressionMaps;
+    use extenddb_storage::{DataEngine, TableEngine, management_store::ManagementStore};
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn snapshot_and_publication_boundaries() {
+        let e = TikvEngine::new(Arc::new(MemoryStore::default()), "snapshot", "us-east-1").unwrap();
+        TikvCatalog::new(e.clone())
+            .create_account("a", "a")
+            .await
+            .unwrap();
+        e.create_table("a",serde_json::from_value(serde_json::json!({"TableName":"source","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"})).unwrap()).await.unwrap();
+        let info = e.table_key_info("a", "source").await.unwrap();
+        let maps = ExpressionMaps::default();
+        for i in 0..20 {
+            e.put_item(
+                &info,
+                Item::from_iter([("pk".into(), AttributeValue::S(format!("{i:02}")))]),
+                false,
+                None,
+                &maps,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mut r = snapshot::Reader::open(&e, "a", "source").await.unwrap();
+        let mut w = restore::Writer::begin(&e, &r.table, "target", r.account_generation.clone())
+            .await
+            .unwrap();
+        w.write(&r.next().await.unwrap()).await.unwrap();
+        assert!(e.table_key_info("a", "target").await.is_err());
+        let key = Item::from_iter([("pk".into(), AttributeValue::S("19".into()))]);
+        e.delete_item(&info, &key, false, None, &maps, None)
+            .await
+            .unwrap();
+        e.put_item(
+            &info,
+            Item::from_iter([("pk".into(), AttributeValue::S("99".into()))]),
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await
+        .unwrap();
+        loop {
+            let rows = r.next().await.unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            w.write(&rows).await.unwrap();
+        }
+        assert_eq!(w.finish().await.unwrap().item_count, 20);
+        let target = e.table_key_info("a", "target").await.unwrap();
+        assert!(e.get_item(&target, &key).await.unwrap().is_some());
+        assert!(
+            e.get_item(
+                &target,
+                &Item::from_iter([("pk".into(), AttributeValue::S("99".into()))])
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let b = e.create_backup("a", "source", "b").await.unwrap();
+        e.db.run(|tx| {
+            let e = e.clone();
+            let arn = b.backup_arn.clone();
+            Box::pin(async move {
+                let b = e.backup(tx, "a", &arn).await?;
+                kv::delete(
+                    tx,
+                    e.key(&[
+                        "backup_data",
+                        b.data_id.as_ref().unwrap(),
+                        "00000000000000000000",
+                    ]),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        assert!(
+            e.restore_table_from_backup("a", "broken", &b.backup_arn)
+                .await
+                .is_err()
+        );
+        assert!(e.table_key_info("a", "broken").await.is_err());
     }
 }

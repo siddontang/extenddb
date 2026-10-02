@@ -15,7 +15,7 @@ flowchart TD
     ENGINE --> DATA[Data and ordered queries]
     ENGINE --> CATALOG[IAM and operational catalog]
     ENGINE --> LIFE[Metadata and maintenance]
-    ENGINE --> BACKUP[Atomic bounded backups]
+    ENGINE --> BACKUP[Streaming snapshots and atomic publication]
     DATA --> PURE[Key codec and index projection]
     DATA --> STREAM[Transactional streams]
     LIFE --> PURE
@@ -168,11 +168,19 @@ TiKV unit/contracts and 15 vector HTTP checks locally.
 
 ## Backup, deployment and validation boundaries
 
-On-demand backup takes one transactional snapshot, capped at 4 MiB encoded.
-Restore atomically publishes a fresh table generation and rebuilt indexes.
-Larger snapshots fail before any backup is published. Large-table export needs
-a pinned timestamp with coordinated GC; this implementation does not pretend
-that independent scan transactions provide a consistent snapshot. PITR is refused explicitly.
+On-demand backup uses a single MVCC snapshot and immutable per-item chunks,
+then publishes its manifest atomically. Restore rebuilds items/indexes under an
+unreachable UUID and publishes the name only after the final batch. Five-minute
+staging leases make failed/cancelled operations reclaimable; an expired worker
+cannot race garbage collection into repopulating a discarded prefix. Legacy
+inline backups remain readable. There is no 4 MiB total backup cap.
+
+PD service safepoint leases protect bulk snapshots against coordinated GC. The
+adapter follows TiDB BR's timestamp-minus-one registration and checks lease
+validity around each page. It never advances GC; the external GC controller must
+honor those barriers. Failed protection or a missing chunk prevents publication.
+Backups remain in the same cluster, so independent disaster recovery still needs
+cluster backups. PITR is the next dependent capability.
 
 The TiDB Rust reference was read at commit
 `6a5b492097d5be084a0b1106da2c7f106c518498`, including

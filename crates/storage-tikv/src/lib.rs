@@ -15,6 +15,7 @@ pub mod backup;
 pub mod bootstrap;
 #[cfg(feature = "client")]
 mod runtime;
+mod staging;
 #[cfg(feature = "client")]
 pub use backend::backend;
 pub mod catalog;

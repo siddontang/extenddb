@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "client")]
+pub mod gc;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
 
@@ -68,6 +70,11 @@ pub trait Transaction: Send {
 /// Long-lived store; a fresh transaction is created on each retry.
 pub trait Store: Send + Sync {
     fn begin(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>>;
+    /// Long-lived read-only snapshot, protected against concurrent MVCC GC.
+    /// Non-GC reference stores can use their normal immutable snapshot.
+    fn snapshot(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
+        self.begin()
+    }
 }
 
 /// Per-request transaction runner. Transport-specific retries stay in the client.
@@ -88,6 +95,13 @@ impl Database {
     pub fn with_max_attempts(mut self, attempts: usize) -> Self {
         self.max_attempts = attempts.max(1);
         self
+    }
+
+    /// Open one owned read-only snapshot for a streaming operation. Unlike `run`,
+    /// this never retries with a newer timestamp; callers must not stage writes
+    /// in this transaction. Dropping the real adapter rolls it back.
+    pub async fn snapshot(&self) -> Result<Box<dyn Transaction>, StorageError> {
+        self.store.snapshot().await.map_err(storage_error)
     }
 
     /// Execute a replayable unit of work and commit it atomically.
