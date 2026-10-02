@@ -188,10 +188,36 @@ pub fn generate_string(byte_length: usize) -> String {
     "a".repeat(byte_length)
 }
 
-/// Timestamp in milliseconds — for unique table name suffixes.
+/// Monotonically unique timestamp suffix, including concurrent calls within a
+/// millisecond and a clock moving backwards. Never use it for elapsed time.
 pub fn ts() -> u128 {
-    SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis()
+        .as_millis() as u64;
+    let previous = LAST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(now.max(last + 1))
+        })
+        .unwrap();
+    u128::from(now.max(previous + 1))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn timestamp_suffixes_are_unique_across_threads() {
+        let values = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| (0..1000).map(|_| super::ts()).collect::<Vec<_>>()))
+                .collect();
+            jobs.into_iter()
+                .flat_map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: std::collections::HashSet<_> = values.iter().collect();
+        assert_eq!(unique.len(), values.len());
+    }
 }

@@ -84,6 +84,19 @@ The SDK runner requires Python 3.10+ and `pytest`, `boto3`, `requests`. The real
 Rust tests fail if their PD endpoint is not configured; ignored tests are not
 counted as cluster validation. Offline unit/contract tests need no TiKV process.
 
+The runner also accepts an executable and its arguments without invoking a
+shell. This allows an independent SDK suite to use the same temporary namespace,
+credentials, HTTPS trust and cleanup. For example:
+
+```sh
+devtools/run-tikv-tests --no-build --command -- \
+  cargo test --manifest-path tests/rust/Cargo.toml --locked -- --test-threads=4
+devtools/run-tikv-tests --no-build -- tests/python
+```
+
+See [expanded compatibility testing](testing-tikv.md) for the pinned external
+DynamoDB suite, complete reproduction commands, measured failures and exclusions.
+
 `verify` checks backend connectivity and catalog counts. `catalog-check` is a
 PostgreSQL physical-table diagnostic and explicitly refuses this backend.
 `migrate` checks schema version 1; there is no PostgreSQL-to-TiKV conversion.

@@ -9,9 +9,17 @@ failed test. Python 3.10+, pytest, boto3 and requests are required. The normal
 init command creates/reuses ~/.extenddb/tls; those TLS files are retained.
 
 Usage: devtools/run-tikv-tests --pd-endpoints 127.0.0.1:2379 -- tests/test_query_scan.py
+
+Use --command --workdir PATH -- EXECUTABLE ARGS to run another SDK suite in
+the same isolated lifecycle. Arguments are executed directly, without a shell.
+The child receives HTTPS endpoints, region, temporary credentials, CA paths,
+and a canonical temporary directory allowed for account-scoped import/export.
+Inherited config overrides and AWS session tokens are removed. The default
+test settings enable throttling and a 50ms control-plane transition delay.
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -31,30 +39,56 @@ DEFAULT_SUITES = [
     'tests/test_batch_operations.py', 'tests/test_transaction_operations.py',
     'tests/test_cross_account_isolation.py', 'tests/test_streams.py',
     'tests/test_ttl.py', 'tests/test_read_paging.py', 'tests/test_multipart_gsi.py',
+    'tests/test_lsi_default_projection.py', 'tests/test_table_throughput_mode.py',
+    'tests/test_update_table_billing_validation.py',
 ]
+
+def test_environment(parent: dict[str, str], endpoint: str, binary: str, password: str) -> dict[str, str]:
+    """Create child-only settings; inherited config/session credentials cannot
+    redirect the temporary server or change the provisioned test account.
+    Endpoint aliases cover the Python, Rust, and Parity SDK suites.
+    """
+    env = {key: value for key, value in parent.items()
+           if not key.startswith('EXTENDDB__')
+           and not key.startswith('AWS_ENDPOINT_URL')
+           and key not in ('AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN')}
+    env.update(EXTENDDB_TEST_ENDPOINT=endpoint, EXTENDDB_ADMIN_USER='test-admin',
+               EXTENDDB_ADMIN_PASSWORD=password, AWS_DEFAULT_REGION='us-east-1',
+               AWS_REGION='us-east-1', AWS_EC2_METADATA_DISABLED='true',
+               EXTENDDB_TEST_ACCOUNT_ID='123456789012',
+               DYNAMODB_ENDPOINT=endpoint, EXTENDDB_ENDPOINT=endpoint, EXTENDDB_BINARY=binary)
+    return env
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--pd-endpoints', default=os.environ.get('TIKV_PD_ENDPOINTS', '127.0.0.1:2379'))
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/extenddb')
     parser.add_argument('--no-build', action='store_true')
+    parser.add_argument('--backend', choices=['tikv', 'sqlite'], default='tikv',
+                        help='Use sqlite for a differential reference run with the same isolation')
+    parser.add_argument('--throttling', choices=['true', 'false'], default='true',
+                        help='Explicit test setting; disable only for a labeled comparison run')
+    parser.add_argument('--command', action='store_true', help='Run the argv after -- instead of pytest, with isolated test credentials and endpoints')
+    parser.add_argument('--workdir', type=Path, default=ROOT, help='Working directory for the test command')
     parser.add_argument('pytest_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    tests = args.pytest_args
+    if tests[:1] == ['--']:
+        tests = tests[1:]
+    if args.command and not tests:
+        parser.error('--command requires an executable after --')
     import requests
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     if not args.no_build:
-        subprocess.run(['cargo', 'build', '-p', 'extenddb', '--no-default-features', '--features', 'tikv'], cwd=ROOT, check=True)
+        subprocess.run(['cargo', 'build', '-p', 'extenddb', '--no-default-features', '--features', args.backend], cwd=ROOT, check=True)
     binary = str(args.binary.resolve())
     namespace = 'wire_test_' + uuid.uuid4().hex
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     endpoint = f'https://127.0.0.1:{port}'
-    env = os.environ.copy()
-    env.update(EXTENDDB_TEST_ENDPOINT=endpoint, EXTENDDB_ADMIN_USER='test-admin',
-               EXTENDDB_ADMIN_PASSWORD=secrets.token_urlsafe(32), AWS_DEFAULT_REGION='us-east-1',
-               EXTENDDB_BINARY=binary)
+    env = test_environment(dict(os.environ), endpoint, binary, secrets.token_urlsafe(32))
     # A temporary directory holds logs/config but never prints credentials.
     with tempfile.TemporaryDirectory(prefix='extenddb-tikv-') as tmp:
         # Keep the exact backend binary stable if another build runs concurrently.
@@ -64,17 +98,35 @@ def main() -> int:
         env['EXTENDDB_BINARY'] = binary
         config = Path(tmp) / 'extenddb.toml'
         logfile = Path(tmp) / 'server.log'
+        # The server canonicalizes jail roots. On macOS /var is an alias of
+        # /private/var; requests must use the same canonical spelling.
+        files = (Path(tmp) / 'files').resolve()
+        files.mkdir()
+        env['TMPDIR'] = str(files)
+        cert = str(Path.home() / '.extenddb/tls/cert.pem')
+        env.update(EXTENDDB_CA_CERT=cert, NODE_EXTRA_CA_CERTS=cert, AWS_CA_BUNDLE=cert)
         server = None
         initialized = False
         try:
-            subprocess.run([binary, 'init', '--backend', 'tikv', '--tikv-pd-endpoints', args.pd_endpoints,
-                            '--tikv-namespace', namespace, '--config', str(config)], env=env, cwd=ROOT, check=True)
+            storage_args = (['--tikv-pd-endpoints', args.pd_endpoints, '--tikv-namespace', namespace]
+                            if args.backend == 'tikv' else ['--sqlite-path', str(Path(tmp) / 'reference.sqlite')])
+            subprocess.run([binary, 'init', '--backend', args.backend, *storage_args,
+                            '--config', str(config)], env=env, cwd=ROOT, check=True)
             initialized = True
             text = config.read_text()
             text, count = re.subn(r'^#?\s*port = 18443[^\n]*$', f'port = {port}', text, count=1, flags=re.MULTILINE)
             if count != 1:
                 raise RuntimeError('Generated config has no expected server port field')
+            text += f'\n[import]\npaths = [{json.dumps(str(files))}]\n\n[export]\npaths = [{json.dumps(str(files))}]\n'
             config.write_text(text)
+            env['EXTENDDB_CONFIG'] = str(config)
+            # Match devtools/run-tests: exercise lifecycle transitions and real
+            # capacity enforcement instead of silently disabling those tests.
+            for name, value in [('control_plane_delay_seconds', '0.05'),
+                                ('index_propagation_delay_ms', '0'),
+                                ('throttling_enabled', args.throttling)]:
+                subprocess.run([binary, 'settings', '--config', str(config), 'set', name, value],
+                               env=env, cwd=ROOT, check=True)
             with logfile.open('w') as log:
                 server = subprocess.Popen([binary, 'serve', '--config', str(config), '--foreground'],
                                           env=env, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
@@ -97,10 +149,8 @@ def main() -> int:
                     key, value = line[7:].split('=', 1)
                     env[key] = value
             subprocess.run([binary, 'verify', '--config', str(config)], env=env, cwd=ROOT, check=True)
-            tests = args.pytest_args
-            if tests[:1] == ['--']:
-                tests = tests[1:]
-            result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '--tb=short', *(tests or DEFAULT_SUITES)], env=env, cwd=ROOT)
+            command = tests if args.command else [sys.executable, '-m', 'pytest', '-q', '--tb=short', *(tests or DEFAULT_SUITES)]
+            result = subprocess.run(command, env=env, cwd=args.workdir)
             if result.returncode:
                 print(logfile.read_text()[-12000:], file=sys.stderr)
             return result.returncode

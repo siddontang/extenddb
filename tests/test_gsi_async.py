@@ -29,6 +29,7 @@ from conftest import wait_for_active, wait_for_deleted
 
 ENDPOINT = os.environ.get("EXTENDDB_TEST_ENDPOINT", "http://localhost:18443").strip()
 EXTENDDB_CONFIG = os.environ.get("EXTENDDB_CONFIG", "extenddb.toml")
+EXTENDDB_BINARY = os.environ.get("EXTENDDB_BINARY", "./target/release/extenddb")
 def extenddb_settings_set(key: str, value: str) -> None:
     """Set a extenddb runtime setting via the CLI.
 
@@ -36,7 +37,7 @@ def extenddb_settings_set(key: str, value: str) -> None:
     database. The setting takes effect on the next read by the server.
     """
     result = subprocess.run(
-        ["./target/release/extenddb", "settings", "--config", EXTENDDB_CONFIG,
+        [EXTENDDB_BINARY, "settings", "--config", EXTENDDB_CONFIG,
          "set", key, value],
         capture_output=True, text=True, timeout=10,
     )
@@ -47,7 +48,7 @@ def extenddb_settings_set(key: str, value: str) -> None:
 def extenddb_settings_get(key: str) -> str:
     """Get a extenddb runtime setting via the CLI."""
     result = subprocess.run(
-        ["./target/release/extenddb", "settings", "--config", EXTENDDB_CONFIG,
+        [EXTENDDB_BINARY, "settings", "--config", EXTENDDB_CONFIG,
          "get", key],
         capture_output=True, text=True, timeout=10,
     )
