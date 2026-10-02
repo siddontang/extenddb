@@ -35,10 +35,13 @@ impl CredentialStore for TikvCatalog {
                         return Ok(Ok(None));
                     };
                     let (bytes, session_name, token, active, expires) = if loc.session {
-                        let Some(s) = a.sessions.get(&id) else {
+                        let Some(s) = records::session(&e, tx, &a, &id).await? else {
                             return Ok(Ok(None));
                         };
-                        if !a.roles.contains_key(&s.role) {
+                        if records::principal(&e, tx, &a, "role", &s.role)
+                            .await?
+                            .is_none()
+                        {
                             return Ok(Ok(None));
                         }
                         if s.expires <= now {
@@ -54,8 +57,8 @@ impl CredentialStore for TikvCatalog {
                             Some(s.expires),
                         )
                     } else {
-                        let Some(k) = a.users.get(&loc.principal).and_then(|u| u.keys.get(&id))
-                        else {
+                        let user = records::principal(&e, tx, &a, "user", &loc.principal).await?;
+                        let Some(k) = user.as_ref().and_then(|u| u.keys.get(&id)) else {
                             return Ok(Ok(None));
                         };
                         (k.encrypted.clone(), None, None, k.active, None)

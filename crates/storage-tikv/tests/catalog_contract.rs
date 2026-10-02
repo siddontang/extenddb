@@ -316,3 +316,86 @@ async fn real_catalog_contract() {
     })
     .await;
 }
+
+async fn large_account_contract(e: TikvEngine) {
+    let c = TikvCatalog::new(e.clone())
+        .with_encryption_key(extenddb_storage::bootstrapper::helpers::generate_encryption_key())
+        .unwrap();
+    c.create_account("large", "large").await.unwrap();
+    // Exercise the storage boundary directly: the logical aggregate exceeds the
+    // old 4 MiB cap, while each independently stored policy is small enough.
+    let policy = json!({"padding": "x".repeat(128 * 1024)});
+    for i in 0..34 {
+        let name = format!("user-{i:03}");
+        c.create_user("large", &name, None).await.unwrap();
+        c.put_policy("large", "user", &name, "large-policy", &policy)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        c.get_account_detail("large")
+            .await
+            .unwrap()
+            .unwrap()
+            .users
+            .len(),
+        34
+    );
+    let key = c.create_access_key("large", "user-033").await.unwrap();
+    assert_eq!(
+        c.lookup_credential(&key.access_key_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .account_id,
+        "large"
+    );
+    assert_eq!(
+        c.fetch_user_policies("large", "user-000")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    c.delete_account("large").await.unwrap();
+    c.create_account("large", "reused").await.unwrap();
+    assert!(
+        c.get_account_detail("large")
+            .await
+            .unwrap()
+            .unwrap()
+            .users
+            .is_empty()
+    );
+    assert!(
+        c.lookup_credential(&key.access_key_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        c.fetch_user_policies("large", "user-000")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    e.lifecycle_step().await.unwrap();
+}
+#[tokio::test]
+async fn account_can_exceed_four_mib() {
+    large_account_contract(
+        TikvEngine::new(
+            Arc::new(MemoryStore::default()),
+            "large-account",
+            "us-east-1",
+        )
+        .unwrap(),
+    )
+    .await;
+}
+#[cfg(feature = "client")]
+#[tokio::test]
+#[ignore = "requires dedicated TiKV/PD cluster; set TIKV_PD_ENDPOINTS"]
+async fn real_large_account_contract() {
+    common::real_contract(large_account_contract).await;
+}

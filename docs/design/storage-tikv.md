@@ -88,13 +88,18 @@ replay checks the original request fingerprint within the ten-minute window.
 
 ## Catalog and credentials
 
-IAM is a per-account aggregate containing principals, memberships, policies,
-boundaries, tags and sessions. This keeps relationship invariants within one
-transaction. A 4 MiB encoded cap fails before any mutation is staged. This is an
-explicit scale tradeoff for IAM, not the data-plane storage layout.
+IAM uses independent principal, policy, membership, key and session records.
+A protected account header serializes management changes and deletion; the
+logical transformation and record diff commit in one transaction. The account
+has no 4 MiB aggregate cap; each physical record is bounded at 4 MiB. Management
+currently materializes the account, so its CPU/memory cost remains O(account
+size). Authentication and authorization read relevant principal and secondary
+index prefixes instead of the whole account. Schema 2 converts legacy inline
+accounts atomically on their next management edit; upgrade requires stopped
+writers and a catalog migration, with no mixed-version writing.
 
 Access-key locators map globally unique IDs to owners. Locator changes and the
-aggregate update share a transaction; duplicate IDs cannot attach the same key
+record updates share a transaction; duplicate IDs cannot attach the same key
 to two accounts. AES-256-GCM binds ciphertext to the access-key ID using AAD.
 There is no unauthenticated fallback, and cached encryption-key buffers are
 zeroized. Credential lookup reads locator and owner in one snapshot and checks

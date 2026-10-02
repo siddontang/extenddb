@@ -58,6 +58,17 @@ async fn lifecycle_is_idempotent_and_destroy_is_scoped() {
         Some(true)
     );
     assert!(b.pending_data_migrations().await.unwrap().is_empty());
+    c.set_setting("catalog_version", "1").await.unwrap();
+    assert!(ready_catalog(e.clone()).await.is_err());
+    assert_eq!(
+        b.pending_data_migrations().await.unwrap(),
+        vec!["tikv-schema-v2"]
+    );
+    b.run_catalog_migrations().await.unwrap();
+    assert!(ready_catalog(e.clone()).await.is_ok());
+    c.set_setting("catalog_version", "999").await.unwrap();
+    assert!(b.run_catalog_migrations().await.is_err());
+    c.set_setting("catalog_version", "2").await.unwrap();
     assert!(b.drop_databases("other").await.is_err());
     b.drop_databases("bootstrap").await.unwrap();
     assert!(ready_catalog(e).await.is_err());
