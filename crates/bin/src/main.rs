@@ -12,7 +12,7 @@
 //! In-tree backends are selected by mutually exclusive Cargo features:
 //! `postgres` (the default production backend), `mongodb` (production, built with
 //! `--no-default-features --features mongodb`), and `sqlite`/`sqlite-memory` (the
-//! dev/CI backend). Exactly one must be enabled: [`set_backend`] installs one
+//! dev/CI backend), plus the experimental `tikv` backend. Exactly one must be enabled: [`set_backend`] installs one
 //! backend per process, so a build with more than one would be ambiguous and is
 //! rejected at compile time.
 
@@ -21,15 +21,24 @@
     all(feature = "postgres", feature = "sqlite"),
     all(feature = "postgres", feature = "mongodb"),
     all(feature = "sqlite", feature = "mongodb"),
+    all(
+        feature = "tikv",
+        any(feature = "postgres", feature = "sqlite", feature = "mongodb")
+    ),
 ))]
 compile_error!(
-    "the `postgres`, `mongodb`, and `sqlite` features are mutually exclusive: a \
+    "the `postgres`, `mongodb`, `tikv`, and `sqlite` features are mutually exclusive: a \
      thin bin installs exactly one backend (e.g. build the MongoDB binary with \
      `--no-default-features --features mongodb`)"
 );
-#[cfg(not(any(feature = "postgres", feature = "mongodb", feature = "sqlite")))]
+#[cfg(not(any(
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "sqlite",
+    feature = "tikv"
+)))]
 compile_error!(
-    "no backend selected: enable the `postgres` (default), `mongodb`, or `sqlite` feature"
+    "no backend selected: enable the `postgres` (default), `mongodb`, `tikv`, or `sqlite` feature"
 );
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
@@ -58,6 +67,9 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "mongodb")]
     extenddb_storage::set_backend(extenddb_storage_mongodb::backend())?;
 
+    #[cfg(feature = "tikv")]
+    extenddb_storage::set_backend(extenddb_storage_tikv::backend())?;
+
     extenddb_app::run(extenddb_app::BuildInfo {
         // Read from the bin crate so the reported version is the deployed
         // artifact's, not a library crate's.
@@ -70,8 +82,25 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "tikv")]
+    #[test]
+    fn builtin_defaults_keep_loopback_and_tls_for_tikv() {
+        install_backend();
+        let cfg = extenddb_config::load_builtin_defaults().unwrap();
+        assert_eq!(cfg.server.bind_addr, "127.0.0.1");
+        assert!(cfg.server.tls.enabled);
+        let storage = extenddb_storage_tikv::config::TikvConfig::from_descriptor(
+            cfg.storage.connection_config(),
+        )
+        .unwrap();
+        assert_eq!(storage.pd_endpoints, ["127.0.0.1:2379"]);
+        assert_eq!(storage.namespace, "extenddb");
+    }
+
     /// Install this binary's backend once for the test process.
     fn install_backend() {
+        #[cfg(feature = "tikv")]
+        let _ = extenddb_storage::set_backend(extenddb_storage_tikv::backend());
         #[cfg(feature = "postgres")]
         let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
         #[cfg(feature = "sqlite")]

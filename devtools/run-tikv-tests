@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Exercise a TiKV build against an existing dedicated PD/TiKV cluster.
+
+Creates a random namespace and temporary config, runs init/serve/verify and SDK
+suites, then stops the server and destroys ONLY its namespace, including after a
+failed test. Python 3.10+, pytest, boto3 and requests are required. The normal
+init command creates/reuses ~/.extenddb/tls; those TLS files are retained.
+
+Usage: devtools/run-tikv-tests --pd-endpoints 127.0.0.1:2379 -- tests/test_query_scan.py
+"""
+from __future__ import annotations
+import argparse
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SUITES = [
+    'tests/test_item_operations.py', 'tests/test_table_operations.py',
+    'tests/test_query_scan.py', 'tests/test_conditional_writes.py',
+    'tests/test_batch_operations.py', 'tests/test_transaction_operations.py',
+    'tests/test_cross_account_isolation.py', 'tests/test_streams.py',
+    'tests/test_ttl.py', 'tests/test_read_paging.py', 'tests/test_multipart_gsi.py',
+]
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--pd-endpoints', default=os.environ.get('TIKV_PD_ENDPOINTS', '127.0.0.1:2379'))
+    parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/extenddb')
+    parser.add_argument('--no-build', action='store_true')
+    parser.add_argument('pytest_args', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    if not args.no_build:
+        subprocess.run(['cargo', 'build', '-p', 'extenddb', '--no-default-features', '--features', 'tikv'], cwd=ROOT, check=True)
+    binary = str(args.binary.resolve())
+    namespace = 'wire_test_' + uuid.uuid4().hex
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    endpoint = f'https://127.0.0.1:{port}'
+    env = os.environ.copy()
+    env.update(EXTENDDB_TEST_ENDPOINT=endpoint, EXTENDDB_ADMIN_USER='test-admin',
+               EXTENDDB_ADMIN_PASSWORD=secrets.token_urlsafe(32), AWS_DEFAULT_REGION='us-east-1',
+               EXTENDDB_BINARY=binary)
+    # A temporary directory holds logs/config but never prints credentials.
+    with tempfile.TemporaryDirectory(prefix='extenddb-tikv-') as tmp:
+        # Keep the exact backend binary stable if another build runs concurrently.
+        pinned_binary = Path(tmp) / 'extenddb-tikv'
+        shutil.copy2(binary, pinned_binary)
+        binary = str(pinned_binary)
+        env['EXTENDDB_BINARY'] = binary
+        config = Path(tmp) / 'extenddb.toml'
+        logfile = Path(tmp) / 'server.log'
+        server = None
+        initialized = False
+        try:
+            subprocess.run([binary, 'init', '--backend', 'tikv', '--tikv-pd-endpoints', args.pd_endpoints,
+                            '--tikv-namespace', namespace, '--config', str(config)], env=env, cwd=ROOT, check=True)
+            initialized = True
+            text = config.read_text()
+            text, count = re.subn(r'^#?\s*port = 18443[^\n]*$', f'port = {port}', text, count=1, flags=re.MULTILINE)
+            if count != 1:
+                raise RuntimeError('Generated config has no expected server port field')
+            config.write_text(text)
+            with logfile.open('w') as log:
+                server = subprocess.Popen([binary, 'serve', '--config', str(config), '--foreground'],
+                                          env=env, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+            deadline = time.monotonic() + 30
+            while True:
+                if server.poll() is not None:
+                    raise RuntimeError('Test server exited during startup')
+                try:
+                    if requests.get(endpoint + '/health', verify=False, timeout=1).ok:
+                        break
+                except requests.RequestException:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Test server did not become healthy')
+                time.sleep(0.1)
+            provision = subprocess.run([sys.executable, str(ROOT / 'devtools/provision-test-credentials')],
+                                       env=env, cwd=ROOT, text=True, capture_output=True, check=True)
+            for line in provision.stdout.splitlines():
+                if line.startswith('export '):
+                    key, value = line[7:].split('=', 1)
+                    env[key] = value
+            subprocess.run([binary, 'verify', '--config', str(config)], env=env, cwd=ROOT, check=True)
+            tests = args.pytest_args
+            if tests[:1] == ['--']:
+                tests = tests[1:]
+            result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '--tb=short', *(tests or DEFAULT_SUITES)], env=env, cwd=ROOT)
+            if result.returncode:
+                print(logfile.read_text()[-12000:], file=sys.stderr)
+            return result.returncode
+        except BaseException:
+            if logfile.exists():
+                print(logfile.read_text()[-12000:], file=sys.stderr)
+            raise
+        finally:
+            if server is not None and server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+            if initialized:
+                subprocess.run([binary, 'destroy', '--config', str(config), '--yes'], env=env, cwd=ROOT, check=True)
+
+if __name__ == '__main__':
+    raise SystemExit(main())

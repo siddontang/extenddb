@@ -1211,6 +1211,7 @@ dependencies = [
  "extenddb-storage-mongodb",
  "extenddb-storage-postgres",
  "extenddb-storage-sqlite",
+ "extenddb-storage-tikv",
 ]
 
 [[package]]

@@ -1,0 +1,57 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+name: TiKV Integration Tests
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tikv-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest boto3 requests
+      - name: Start isolated PD and TiKV
+        run: |
+          docker run -d --name extenddb-pd --network host pingcap/pd:v8.5.5 \
+            --name=pd --client-urls=http://127.0.0.1:2379 \
+            --advertise-client-urls=http://127.0.0.1:2379 \
+            --peer-urls=http://127.0.0.1:2380 --advertise-peer-urls=http://127.0.0.1:2380
+          docker run -d --name extenddb-tikv --network host pingcap/tikv:v8.5.5 \
+            --addr=127.0.0.1:20160 --advertise-addr=127.0.0.1:20160 \
+            --status-addr=127.0.0.1:20180 --pd=127.0.0.1:2379
+          for attempt in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:20180/status >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Run deterministic and real-store contracts
+        env:
+          TIKV_PD_ENDPOINTS: 127.0.0.1:2379
+        run: cargo test -p extenddb-storage-tikv --features client,test-support -- --include-ignored
+      - name: Check TiKV backend
+        run: cargo clippy -p extenddb-storage-tikv --all-targets --features client,test-support -- -D warnings
+      - name: Run normal init, serve, SDK and destroy workflows
+        run: devtools/run-tikv-tests
+      - name: Run concurrency, authorization and catalog SDK contracts
+        run: |
+          devtools/run-tikv-tests --no-build -- \
+            tests/test_concurrency.py tests/test_multipart_gsi.py \
+            tests/test_gsi_attribute_definitions.py tests/test_idempotency_account_scope.py \
+            tests/test_auth_integration.py tests/test_auth_permissions.py \
+            tests/test_abac.py tests/test_metrics.py
+      - name: TiKV logs
+        if: failure()
+        run: |
+          docker logs extenddb-pd
+          docker logs extenddb-tikv

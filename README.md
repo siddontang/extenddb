@@ -256,6 +256,15 @@ ExtendDB uses two lightweight processes for tracking decisions:
 
 Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNERS).
 
+## Experimental TiKV backend
+
+Build a standalone TiKV backend with
+`cargo build --no-default-features --features tikv`. It stores catalog/IAM,
+items, indexes and streams in transactional TiKV, without a PostgreSQL service.
+See [TiKV setup and operational limits](docs/local-tikv-setup.md) and the
+[module design and tests](crates/storage-tikv/README.md). Existing PostgreSQL
+data is not migrated automatically; this backend is experimental.
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
