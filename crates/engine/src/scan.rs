@@ -388,7 +388,9 @@ pub async fn handle_scan(
         ));
     }
 
-    let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
+    // As in Query, an omitted Select on an index means ALL_PROJECTED_ATTRIBUTES.
+    // An explicit ProjectionExpression still takes precedence in PostRead.
+    let index_proj = if matches!(input.select, None | Some(Select::AllProjectedAttributes)) {
         index_info.as_ref()
     } else {
         None

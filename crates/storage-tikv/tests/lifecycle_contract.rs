@@ -154,6 +154,10 @@ async fn lifecycle_contract(e: TikvEngine, clock: Arc<TestClock>) {
         .await
         .unwrap();
     assert_ne!(restored.table_id, d.table_id);
+    assert_eq!(restored.table_status, TableStatus::Creating);
+    assert!(e.table_key_info(a, "restored").await.is_err());
+    clock.0.fetch_add(1000, Ordering::SeqCst);
+    e.lifecycle_step().await.unwrap();
     let restored_info = e.table_key_info(a, "restored").await.unwrap();
     assert_eq!(
         e.scan(&restored_info, Some(256), None, None, None, None)

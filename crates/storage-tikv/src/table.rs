@@ -98,6 +98,11 @@ impl Table {
             .collect();
         d.global_secondary_indexes = (!gsis.is_empty()).then_some(gsis);
         d.local_secondary_indexes = (!lsis.is_empty()).then_some(lsis);
+        // Provisioned mode stays in the internal catalog, but DynamoDB omits
+        // BillingModeSummary (and its wire alias) for provisioned tables.
+        d.billing_mode_summary = d
+            .billing_mode_summary
+            .filter(|summary| summary.billing_mode == BillingMode::PayPerRequest);
         d
     }
 }
@@ -139,7 +144,7 @@ impl TikvEngine {
             return Err(StorageError::TableNotFound(info.table_name.clone()));
         }
         if t.description.table_status != TableStatus::Active {
-            return Err(StorageError::TableNotActive(info.table_name.clone()));
+            return Err(StorageError::TableNotFound(info.table_name.clone()));
         }
         Ok(t)
     }
@@ -215,11 +220,7 @@ impl TableEngine for TikvEngine {
                         kv::put(tx, guard, &(n + 1)).await?;
                         let id = uuid::Uuid::new_v4().to_string();
                         let now = e.clock.now_ms();
-                        let delay = e
-                            .setting(tx, "control_plane_delay_seconds", 0)
-                            .await?
-                            .max(0)
-                            * 1000;
+                        let delay = e.control_plane_delay_ms(tx).await?;
                         let mut indexes = vec![];
                         for i in input.global_secondary_indexes.unwrap_or_default() {
                             indexes.push(Index {
@@ -329,7 +330,7 @@ impl TableEngine for TikvEngine {
                 Box::pin(async move {
                     let t = e.table_by_name(tx, &a, &n).await?;
                     if t.description.table_status != TableStatus::Active {
-                        return Err(StorageError::TableNotActive(n));
+                        return Err(StorageError::TableNotFound(n));
                     }
                     Ok(t.key_info())
                 })
@@ -475,6 +476,7 @@ impl TableEngine for TikvEngine {
                     if let Some(v) = input.deletion_protection_enabled {
                         t.description.deletion_protection_enabled = v;
                     }
+                    validate_billing_update(&t.description, &input)?;
                     if let Some(v) = input.billing_mode {
                         t.description.billing_mode_summary = Some(BillingModeSummary {
                             billing_mode: v,
@@ -547,6 +549,46 @@ impl TableEngine for TikvEngine {
             .await
         })
     }
+}
+
+/// Validate against the current catalog in the same transaction as the update.
+/// Request-only validation cannot infer the effective mode when it is omitted.
+fn validate_billing_update(
+    current: &TableDescription,
+    input: &UpdateTableInput,
+) -> Result<(), StorageError> {
+    let mode = current
+        .billing_mode_summary
+        .as_ref()
+        .map_or(BillingMode::Provisioned, |s| s.billing_mode);
+    let effective = input.billing_mode.unwrap_or(mode);
+    if let Some(requested) = &input.provisioned_throughput {
+        if effective == BillingMode::PayPerRequest {
+            return Err(StorageError::Validation(
+                "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST".into(),
+            ));
+        }
+        let old = &current.provisioned_throughput;
+        if input.billing_mode == Some(BillingMode::Provisioned)
+            && mode == BillingMode::Provisioned
+            && old.read_capacity_units == requested.read_capacity_units
+            && old.write_capacity_units == requested.write_capacity_units
+        {
+            return Err(StorageError::NoOpUpdate(format!(
+                "The provisioned throughput for the table will not change. \
+                 The requested value equals the current value. \
+                 Current ReadCapacityUnits provisioned for the table: {}. \
+                 Requested ReadCapacityUnits: {}. \
+                 Current WriteCapacityUnits provisioned for the table: {}. \
+                 Requested WriteCapacityUnits: {}.",
+                old.read_capacity_units,
+                requested.read_capacity_units,
+                old.write_capacity_units,
+                requested.write_capacity_units,
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Separate read-dependency slots prevent unrelated item writes from locking

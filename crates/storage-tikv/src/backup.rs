@@ -133,9 +133,10 @@ impl BackupEngine for TikvEngine {
                     let size = items.iter().map(item_size_bytes).sum::<usize>();
                     let details = BackupDetails {
                         backup_arn: format!(
-                            "{}/backup/{}",
+                            "{}/backup/{:017}-{:08x}",
                             t.description.table_arn,
-                            uuid::Uuid::new_v4()
+                            e.clock.now_ms(),
+                            rand::random::<u32>()
                         ),
                         backup_name: b,
                         backup_status: "AVAILABLE".into(),
@@ -164,7 +165,15 @@ impl BackupEngine for TikvEngine {
                             "TiKV on-demand backup exceeds the 4 MiB snapshot limit".into(),
                         ));
                     }
-                    kv::put(tx, e.key(&["backup", &a, &details.backup_arn]), &backup).await?;
+                    let key = e.key(&["backup", &a, &details.backup_arn]);
+                    // The DynamoDB-shaped suffix is only 32 bits. Protect its
+                    // absence and retry the whole closure on a collision.
+                    if kv::get::<Backup>(tx, key.clone()).await?.is_some() {
+                        return Err(StorageError::TransactionConflict(
+                            "Backup id collision".into(),
+                        ));
+                    }
+                    kv::put(tx, key, &backup).await?;
                     Ok(details)
                 })
             })
@@ -230,8 +239,9 @@ impl BackupEngine for TikvEngine {
             e.db.run(|tx| {
                 let (e, a, b) = (e.clone(), a.clone(), b.clone());
                 Box::pin(async move {
-                    let desc = e.backup(tx, &a, &b).await?.description();
+                    let mut desc = e.backup(tx, &a, &b).await?.description();
                     kv::delete(tx, e.key(&["backup", &a, &b])).await?;
+                    desc.backup_details.backup_status = "DELETED".into();
                     Ok(desc)
                 })
             })
@@ -271,7 +281,11 @@ impl BackupEngine for TikvEngine {
                     t.description.table_arn =
                         extenddb_storage::util::table_arn(&e.region, &a, &t.description.table_name);
                     t.description.creation_date_time = e.clock.now_ms() as f64 / 1000.;
-                    t.description.table_status = TableStatus::Active;
+                    // Data and indexes are already complete at commit. Expose
+                    // the normal CREATING -> ACTIVE lifecycle without allowing
+                    // a reader to observe an incomplete restored table.
+                    t.description.table_status = TableStatus::Creating;
+                    t.transition_at = e.clock.now_ms() + e.control_plane_delay_ms(tx).await?.max(1);
                     t.description.latest_stream_arn = None;
                     t.description.latest_stream_label = None;
                     t.description.stream_specification = None;

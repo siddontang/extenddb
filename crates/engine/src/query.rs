@@ -433,8 +433,9 @@ pub async fn handle_query(
         extenddb_core::validation::IS_QUERY,
     )?;
 
-    // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
-    let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
+    // Index reads default to ALL_PROJECTED_ATTRIBUTES. Storage may return the
+    // base image for LSI reachback; trim it unless the request asks otherwise.
+    let index_proj = if matches!(input.select, None | Some(Select::AllProjectedAttributes)) {
         index_info.as_ref()
     } else {
         None

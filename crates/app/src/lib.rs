@@ -172,6 +172,7 @@ fn run_interactive<T>(
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .try_init()
         .unwrap_or_else(|e| eprintln!("Warning: logging init failed: {e}"));
     tokio::runtime::Builder::new_current_thread()

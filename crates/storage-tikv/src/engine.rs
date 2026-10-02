@@ -72,12 +72,12 @@ impl TikvEngine {
         k.extend(codec::tuple(parts));
         k
     }
-    pub(crate) async fn setting(
+    pub(crate) async fn setting<T: std::str::FromStr>(
         &self,
         tx: &mut dyn crate::kv::Transaction,
         name: &str,
-        default: i64,
-    ) -> Result<i64, extenddb_storage::error::StorageError> {
+        default: T,
+    ) -> Result<T, extenddb_storage::error::StorageError> {
         let value: Option<String> = crate::kv::get(tx, self.key(&["setting", name])).await?;
         value
             .map(|v| {
@@ -88,6 +88,26 @@ impl TikvEngine {
                 })
             })
             .unwrap_or(Ok(default))
+    }
+
+    /// Runtime settings permit fractional seconds (the SDK runner uses 0.05).
+    /// Validate before conversion so malformed values cannot overflow deadlines.
+    pub(crate) async fn control_plane_delay_ms(
+        &self,
+        tx: &mut dyn crate::kv::Transaction,
+    ) -> Result<i64, extenddb_storage::error::StorageError> {
+        let seconds = self
+            .setting(tx, "control_plane_delay_seconds", 0.0_f64)
+            .await?;
+        std::time::Duration::try_from_secs_f64(seconds)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .filter(|d| self.clock.now_ms().checked_add(*d).is_some())
+            .ok_or_else(|| {
+                extenddb_storage::error::StorageError::Internal(
+                    "Invalid setting control_plane_delay_seconds".into(),
+                )
+            })
     }
 }
 
