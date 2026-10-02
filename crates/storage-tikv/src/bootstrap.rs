@@ -18,7 +18,7 @@ use extenddb_storage::{
 };
 use std::sync::Arc;
 /// On-disk schema version, independent of the server release version.
-pub const SCHEMA_VERSION: &str = "3";
+pub const SCHEMA_VERSION: &str = "4";
 pub struct TikvBootstrapper {
     engine: TikvEngine,
     config: TikvConfig,
@@ -98,6 +98,7 @@ impl Bootstrapper for TikvBootstrapper {
                         && version != SCHEMA_VERSION
                         && version != "1"
                         && version != "2"
+                        && version != "3"
                     {
                         return Ok(Err(OpError::Validation(format!(
                             "Unsupported TiKV schema version {version}; expected {SCHEMA_VERSION}"
@@ -116,8 +117,8 @@ impl Bootstrapper for TikvBootstrapper {
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
         match self.read_catalog_version().await? {
             Some(v) if v == SCHEMA_VERSION => Ok(vec![]),
-            None => Ok(vec!["tikv-schema-v3".into()]),
-            Some(v) if v == "1" || v == "2" => Ok(vec!["tikv-schema-v3".into()]),
+            None => Ok(vec!["tikv-schema-v4".into()]),
+            Some(v) if v == "1" || v == "2" || v == "3" => Ok(vec!["tikv-schema-v4".into()]),
             Some(v) => Err(OpError::Validation(format!(
                 "Unsupported TiKV schema version {v}"
             ))),
@@ -247,6 +248,7 @@ impl Bootstrapper for TikvBootstrapper {
                 "Destroy namespace does not match configured namespace".into(),
             ));
         }
+        self.engine.destroy_pitr().await.map_err(op_error)?;
         let p = self.engine.key(&[]);
         loop {
             let count = self

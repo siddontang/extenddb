@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod backup;
 pub mod bootstrap;
+pub mod pitr;
 #[cfg(feature = "client")]
 mod runtime;
 mod staging;

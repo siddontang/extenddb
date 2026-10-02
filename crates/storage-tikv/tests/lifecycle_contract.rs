@@ -219,7 +219,10 @@ async fn lifecycle_contract(e: TikvEngine, clock: Arc<TestClock>) {
     e.delete_backup(a, &backup.backup_arn).await.unwrap();
     assert!(e.list_backups(a, None).await.unwrap().is_empty());
     let retained_backup = e.create_backup(a, "restored", "retained").await.unwrap();
-    assert!(e.update_continuous_backups(a, "items", true).await.is_err());
+    e.update_continuous_backups(a, "items", true).await.unwrap();
+    e.update_continuous_backups(a, "items", false)
+        .await
+        .unwrap();
     for name in ["items", "restored"] {
         e.delete_table(
             a,

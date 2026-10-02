@@ -10,6 +10,7 @@
 //! Dropping an unfinished request schedules rollback on the Tokio runtime;
 //! TiKV's lock TTL remains the final recovery mechanism after process death.
 
+use super::gc::Barriers;
 use super::{Error, Pair, Store, Transaction};
 use futures::future::BoxFuture;
 use std::sync::Arc;
@@ -47,6 +48,34 @@ impl Store for TikvStore {
         })
     }
 
+    fn timestamp(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async move {
+            Ok(self
+                .client
+                .current_timestamp()
+                .await
+                .map_err(transport)?
+                .version())
+        })
+    }
+    fn snapshot_at(&self, ts: u64) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
+        Box::pin(async move {
+            let guard = super::gc::Guard::acquire(self.gc.clone(), ts).await?;
+            Ok(Box::new(Pinned {
+                inner: self.client.snapshot(
+                    tikv_client::Timestamp::from_version(ts),
+                    tikv_client::TransactionOptions::new_optimistic(),
+                ),
+                guard,
+            }) as Box<dyn Transaction>)
+        })
+    }
+    fn retain(&self, id: String, floor: u64, ttl: i64) -> BoxFuture<'_, Result<u64, Error>> {
+        self.gc.pin(id, floor, ttl)
+    }
+    fn gc_floor(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        self.gc.safe_point()
+    }
     fn begin(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
         Box::pin(async move {
             let tx = self.client.begin_optimistic().await.map_err(transport)?;

@@ -180,7 +180,17 @@ adapter follows TiDB BR's timestamp-minus-one registration and checks lease
 validity around each page. It never advances GC; the external GC controller must
 honor those barriers. Failed protection or a missing chunk prevents publication.
 Backups remain in the same cluster, so independent disaster recovery still needs
-cluster backups. PITR is the next dependent capability.
+cluster backups.
+
+PITR uses actual TiKV commit-time MVCC versions through an explicit
+`RestorePoint` storage capability. Per-table recovery generations install PD
+retention barriers and an independent worker renews them. Recovery streams the
+historical base snapshot through the same atomic-publication restore writer,
+using current source table/index settings. A fixed 35-day window and 24-hour
+renewal lease bound retention; after a prolonged outage, reconciliation narrows
+the window to surviving history. No current-state fallback is permitted.
+Deleted source tables, source ARNs and restore overrides remain unsupported.
+The module README documents GC coordination, cleanup and cluster-wide disk cost.
 
 The TiDB Rust reference was read at commit
 `6a5b492097d5be084a0b1106da2c7f106c518498`, including
@@ -220,3 +230,26 @@ verification for local self-signed HTTPS. The GitHub Actions workflow provisions
 its own PD/TiKV cluster and runs the same contracts and SDK paths; this validation
 record describes local execution, not a completed hosted CI run. Multi-node
 fault injection, long-running GC and production performance remain unvalidated.
+
+## Follow-on capability implementation order
+
+| Order | Capability | Relative effort and dependency |
+|---|---|---|
+| 1 | Exact vector search | Reuses shared vector validation, projection, scoring semantics and lifecycle driver; no new catalog layout |
+| 2 | IAM account-size limit removal | Normalize records, preserve the account transaction fence, migrate legacy documents and target authorization reads |
+| 3 | Backup-size limit removal | Requires one protected snapshot across batches, staged manifests, restore publication and failure cleanup |
+| 4 | PITR | Builds on protected historical reads and bulk restore, adding durable retention state, time-aware API and recovery authorization |
+
+All stages use injected store/clock boundaries and signed incremental commits.
+Follow-on local validation passed 1,254 workspace tests (4 existing ignored),
+54 TiKV unit/contracts including real-store runs, the 81-test IAM HTTP regression, the 15-test vector HTTP
+suite, and the combined seven-test PITR/backup/vector HTTP regression. These
+counts include overlapping coverage; they are not independent totals. Tests use
+a dedicated PD/TiKV 8.5.5 cluster and isolated namespaces. The PD check after
+cleanup contained only the standard GC worker safepoint. Multi-node failover,
+35-day soak tests and production capacity benchmarks remain outstanding.
+
+The final follow-on checks also passed strict Clippy for the TiKV crate and
+binary, workspace formatting, and a locked Rust 1.88.0 TiKV binary check. The
+combined HTTP suite includes explicit source-table restore denial and target-table
+write denial. Hosted CI results are not claimed here.

@@ -8,8 +8,8 @@
 //! generation and atomically publish it. Leased staging prefixes make failures,
 //! cancellation and unknown commit outcomes reclaimable without deleting a
 //! successfully published result. Legacy inline backups remain readable.
-mod restore;
-mod snapshot;
+pub(crate) mod restore;
+pub(crate) mod snapshot;
 use crate::{TikvEngine, index, kv, table::Table};
 use extenddb_core::types::*;
 use extenddb_storage::{BackupEngine, error::StorageError};
@@ -305,23 +305,7 @@ impl BackupEngine for TikvEngine {
         name: &str,
     ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
         let (e, a, n) = (self.clone(), account.to_owned(), name.to_owned());
-        Box::pin(async move {
-            e.db.run(|tx| {
-                let (e, a, n) = (e.clone(), a.clone(), n.clone());
-                Box::pin(async move {
-                    e.table_by_name(tx, &a, &n).await?;
-                    Ok(ContinuousBackupsDescription {
-                        continuous_backups_status: "DISABLED".into(),
-                        point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                            point_in_time_recovery_status: "DISABLED".into(),
-                            earliest_restorable_date_time: None,
-                            latest_restorable_date_time: None,
-                        }),
-                    })
-                })
-            })
-            .await
-        })
+        Box::pin(async move { e.describe_pitr(&a, &n).await })
     }
     fn update_continuous_backups(
         &self,
@@ -329,26 +313,36 @@ impl BackupEngine for TikvEngine {
         name: &str,
         enabled: bool,
     ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        if enabled {
-            return Box::pin(async {
-                Err(StorageError::Unsupported(
-                    "TiKV point-in-time recovery".into(),
-                ))
-            });
-        }
-        self.describe_continuous_backups(account, name)
+        let (e, a, n) = (self.clone(), account.to_owned(), name.to_owned());
+        Box::pin(async move { e.set_pitr(&a, &n, enabled).await })
+    }
+    fn restore_table_at(
+        &self,
+        account: &str,
+        source: &str,
+        target: &str,
+        point: extenddb_storage::RestorePoint,
+    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
+        let (e, a, s, t) = (
+            self.clone(),
+            account.to_owned(),
+            source.to_owned(),
+            target.to_owned(),
+        );
+        Box::pin(async move { e.restore_pitr(&a, &s, &t, point).await })
     }
     fn restore_table_to_point_in_time(
         &self,
-        _account: &str,
-        _source: &str,
-        _target: &str,
+        account: &str,
+        source: &str,
+        target: &str,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        Box::pin(async {
-            Err(StorageError::Unsupported(
-                "TiKV point-in-time recovery".into(),
-            ))
-        })
+        self.restore_table_at(
+            account,
+            source,
+            target,
+            extenddb_storage::RestorePoint::Latest,
+        )
     }
 }
 

@@ -17,14 +17,23 @@ pub(crate) struct Reader {
 }
 impl Reader {
     pub async fn open(e: &TikvEngine, account: &str, name: &str) -> Result<Self, StorageError> {
-        let mut tx = e.db.snapshot().await?;
-        let table = e.table_by_name(tx.as_mut(), account, name).await?;
+        let reader = Self::from_snapshot(e, account, name, e.db.snapshot().await?).await?;
+        let table = &reader.table;
         if table.description.table_status != TableStatus::Active
             || table.indexes.iter().any(|i| i.cursor.is_some())
             || table.vectors.iter().any(|v| v.backfilling.is_some())
         {
             return Err(StorageError::TableNotActive(name.into()));
         }
+        Ok(reader)
+    }
+    pub async fn from_snapshot(
+        e: &TikvEngine,
+        account: &str,
+        name: &str,
+        mut tx: Box<dyn kv::Transaction>,
+    ) -> Result<Self, StorageError> {
+        let table = e.table_by_name(tx.as_mut(), account, name).await?;
         let a: Account = kv::get(tx.as_mut(), e.key(&["account", account]))
             .await?
             .ok_or_else(super::missing)?;

@@ -86,7 +86,7 @@ counted as cluster validation. Offline unit/contract tests need no TiKV process.
 
 `verify` checks backend connectivity and catalog counts. `catalog-check` is a
 PostgreSQL physical-table diagnostic and explicitly refuses this backend.
-`migrate` upgrades catalog schemas 1/2 to 3; stop all namespace writers before
+`migrate` upgrades catalog schemas 1–3 to 4; stop all namespace writers before
 upgrading, then restart with the new binary. Inline IAM accounts convert on their
 next management edit. Mixed-version writers and direct downgrade are unsupported; there is no PostgreSQL-to-TiKV conversion.
 
@@ -103,8 +103,10 @@ after failure; it is not a single atomic cluster operation.
 ## Limits before production use
 
 Read the [backend limits](../crates/storage-tikv/README.md#scope-and-deployment-limits)
-before planning a rollout. Vector search uses exact partition scans; PITR remains unsupported. Backups are
-streamed from a GC-protected snapshot with atomic publication; IAM has no account-wide size cap; individual records are bounded at 4 MiB. GSIs are synchronous. Existing data needs an explicit migration plan.
+before planning a rollout. Vector search uses exact partition scans. Backups
+stream from a GC-protected snapshot with atomic publication. IAM has no account
+size cap; individual records are bounded at 4 MiB. GSIs are synchronous. Existing
+PostgreSQL data needs an explicit migration plan.
 
 TiKV's old MVCC versions require coordinated garbage collection. ExtendDB does
 not advance the cluster-wide GC safepoint because it cannot account for other
@@ -112,3 +114,33 @@ clients' active transactions. An external GC controller, restore drills, and
 failure/partition tests are prerequisites for sustained production operation.
 Logical TTL and stream retention do not replace MVCC GC. The namespace prefix
 also does not provide isolation from a client with direct cluster access.
+
+## Enable and use PITR
+
+With your normal signed AWS CLI credentials and `AWS_CA_BUNDLE` configured:
+
+```sh
+aws dynamodb update-continuous-backups --table-name Music \
+  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true \
+  --endpoint-url https://127.0.0.1:18443
+aws dynamodb describe-continuous-backups --table-name Music \
+  --endpoint-url https://127.0.0.1:18443
+aws dynamodb restore-table-to-point-in-time --source-table-name Music \
+  --target-table-name MusicRecovered --restore-date-time '<time inside reported window>' \
+  --endpoint-url https://127.0.0.1:18443
+```
+
+Use `--use-latest-restorable-time` instead of `--restore-date-time` for a current
+snapshot. Restore targets must be new table names. Explicit times have
+millisecond precision. The source must still exist; deleted tables, source ARNs
+and restore overrides are not yet supported. Restores run synchronously.
+
+PITR keeps up to 35 days by renewing PD service safepoints. The retention worker
+runs separately from data maintenance. Its lease lasts 24 hours; longer worker
+outages can allow GC to shorten the window. Always inspect the reported earliest
+and latest times. PD/GC errors refuse recovery rather than returning current or
+partial data. Monitor retention-renewal errors and cluster disk usage: the
+barriers affect the whole shared cluster. The external GC controller must honor
+these service safepoints. A backup stored in the same cluster is not protection
+against cluster loss. See the [PITR module contract](../crates/storage-tikv/README.md#point-in-time-recovery-catalog-schema-4)
+for upgrade, cleanup and authorization details.

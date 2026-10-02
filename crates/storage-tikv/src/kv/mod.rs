@@ -75,6 +75,22 @@ pub trait Store: Send + Sync {
     fn snapshot(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
         self.begin()
     }
+
+    /// Current TSO (milliseconds in upper bits, 18 logical bits).
+    fn timestamp(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async { Err(Error::Transport("Historical snapshots unavailable".into())) })
+    }
+    fn snapshot_at(&self, _timestamp: u64) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
+        Box::pin(async { Err(Error::Transport("Historical snapshots unavailable".into())) })
+    }
+    /// Install/renew a named retention barrier; zero TTL removes it. Returns the
+    /// minimum accepted service floor. This must never advance the GC safepoint.
+    fn retain(&self, _id: String, _floor: u64, _ttl: i64) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async { Err(Error::Transport("History retention unavailable".into())) })
+    }
+    fn gc_floor(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async { Err(Error::Transport("GC visibility unavailable".into())) })
+    }
 }
 
 /// Per-request transaction runner. Transport-specific retries stay in the client.
@@ -102,6 +118,22 @@ impl Database {
     /// in this transaction. Dropping the real adapter rolls it back.
     pub async fn snapshot(&self) -> Result<Box<dyn Transaction>, StorageError> {
         self.store.snapshot().await.map_err(storage_error)
+    }
+
+    pub async fn timestamp(&self) -> Result<u64, StorageError> {
+        self.store.timestamp().await.map_err(storage_error)
+    }
+    pub async fn snapshot_at(&self, ts: u64) -> Result<Box<dyn Transaction>, StorageError> {
+        self.store.snapshot_at(ts).await.map_err(storage_error)
+    }
+    pub async fn retain(&self, id: String, floor: u64, ttl: i64) -> Result<u64, StorageError> {
+        self.store
+            .retain(id, floor, ttl)
+            .await
+            .map_err(storage_error)
+    }
+    pub async fn gc_floor(&self) -> Result<u64, StorageError> {
+        self.store.gc_floor().await.map_err(storage_error)
     }
 
     /// Execute a replayable unit of work and commit it atomically.

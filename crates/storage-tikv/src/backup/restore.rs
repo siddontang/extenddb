@@ -73,6 +73,21 @@ impl Writer {
                         stage.touch(tx).await?;
                         kv::put(tx, e.item_key(&info, &item)?, &item).await?;
                         for i in &t.indexes {
+                            // Historical items can predate a current GSI schema.
+                            // Preserve base data and apply the same poison-row
+                            // omission used by online index backfill.
+                            if extenddb_core::validation::validate_index_keys(
+                                &item,
+                                &[extenddb_core::validation::IndexKeyRef {
+                                    index_name: &i.name,
+                                    key_schema: &i.schema,
+                                }],
+                                &info.attribute_definitions,
+                            )
+                            .is_err()
+                            {
+                                continue;
+                            }
                             index::apply(
                                 &e,
                                 tx,
