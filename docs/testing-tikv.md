@@ -18,7 +18,9 @@ and several DynamoDB features and validation details remain incomplete.
   oracle measured by this run.
 * [Scylla Alternator tests](https://github.com/scylladb/scylladb/blob/master/test/alternator/README.md)
   are another candidate: their documented targets include both Alternator and
-  real DynamoDB. They were located but **not run** in this exercise.
+  real DynamoDB. They were located but **not run** in this initial exercise.
+  A subsequent run and independent TTL contracts are recorded in the
+  [Alternator coverage report](testing-alternator.md).
 
 No tests in this exercise targeted AWS or published results to an upstream
 service. Every SDK suite used temporary credentials and an isolated local
