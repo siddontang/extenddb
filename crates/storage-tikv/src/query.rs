@@ -105,6 +105,92 @@ fn path_name<'a>(
         _ => Err(StorageError::Validation("Invalid key path".into())),
     }
 }
+
+fn sort_path(condition: &SortKeyCondition) -> &[PathElement] {
+    match condition {
+        SortKeyCondition::Compare { path, .. }
+        | SortKeyCondition::Between { path, .. }
+        | SortKeyCondition::BeginsWith { path, .. } => path,
+    }
+}
+
+/// Encode only a contiguous prefix of the physical sort-key tuple. Parsed
+/// expressions need not follow schema order, and a range may target a later
+/// component. Remaining conditions are evaluated before the request limit.
+fn query_bounds(
+    mut prefix: Vec<u8>,
+    schema: &[KeySchemaElement],
+    condition: Option<&KeyCondition>,
+    maps: &ExpressionMaps,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), StorageError> {
+    let Some(condition) = condition else {
+        return bounds(prefix, None, maps);
+    };
+    for key in schema.iter().filter(|k| k.key_type == KeyType::Range) {
+        if let Some(main) = &condition.sk_condition
+            && path_name(sort_path(main), maps)? == key.attribute_name
+        {
+            if let SortKeyCondition::Compare {
+                op: CompareOp::Eq,
+                value,
+                ..
+            } = main
+            {
+                prefix = append(prefix, value, maps)?;
+                continue;
+            }
+            return bounds(prefix, Some(main), maps);
+        }
+        let mut equality = None;
+        for (path, value) in &condition.extra_sk_conditions {
+            if path_name(path, maps)? == key.attribute_name {
+                equality = Some(value);
+                break;
+            }
+        }
+        if let Some(value) = equality {
+            prefix = append(prefix, value, maps)?;
+        } else {
+            break;
+        }
+    }
+    bounds(prefix, None, maps)
+}
+
+fn matches_sort(
+    item: &Item,
+    condition: &SortKeyCondition,
+    maps: &ExpressionMaps,
+) -> Result<bool, StorageError> {
+    let Some(actual) = item.get(path_name(sort_path(condition), maps)?) else {
+        return Ok(false);
+    };
+    let actual = codec::scalar(actual)?;
+    Ok(match condition {
+        SortKeyCondition::Compare {
+            op,
+            value: expected,
+            ..
+        } => {
+            let expected = codec::scalar(&value(expected, maps)?)?;
+            match op {
+                CompareOp::Eq => actual == expected,
+                CompareOp::Ne => actual != expected,
+                CompareOp::Lt => actual < expected,
+                CompareOp::Le => actual <= expected,
+                CompareOp::Gt => actual > expected,
+                CompareOp::Ge => actual >= expected,
+            }
+        }
+        SortKeyCondition::Between { low, high, .. } => {
+            actual >= codec::scalar(&value(low, maps)?)?
+                && actual <= codec::scalar(&value(high, maps)?)?
+        }
+        SortKeyCondition::BeginsWith { prefix, .. } => {
+            actual.starts_with(&codec::scalar(&value(prefix, maps)?)?)
+        }
+    })
+}
 pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
@@ -160,22 +246,8 @@ impl TikvEngine {
                             .collect();
                         codec::item_key(&mut prefix, &values, &hashes)?;
                     }
-                    let (mut start, mut end) = if let Some(KeyCondition {
-                        sk_condition: Some(SortKeyCondition::Between { low, high, .. }),
-                        ..
-                    }) = &r.condition
-                    {
-                        (
-                            append(prefix.clone(), low, &r.maps)?,
-                            Some(successor(append(prefix, high, &r.maps)?)?),
-                        )
-                    } else {
-                        bounds(
-                            prefix,
-                            r.condition.as_ref().and_then(|c| c.sk_condition.as_ref()),
-                            &r.maps,
-                        )?
-                    };
+                    let (mut start, mut end) =
+                        query_bounds(prefix, schema, r.condition.as_ref(), &r.maps)?;
                     if let Some(cursor) = &r.start {
                         let key = if let Some(i) = &idx {
                             index::entry_key(
@@ -215,7 +287,14 @@ impl TikvEngine {
                         let next = rows.last().unwrap().0.clone();
                         let short = rows.len() < 128;
                         for (_, bytes) in rows {
-                            let item: Item = kv::decode(&bytes)?;
+                            let mut item: Item = kv::decode(&bytes)?;
+                            if idx.as_ref().is_some_and(|i| i.local) {
+                                item = kv::get::<Item>(tx, e.item_key(&table.key_info(), &item)?)
+                                    .await?
+                                    .ok_or_else(|| {
+                                        StorageError::Internal("LSI entry has no base item".into())
+                                    })?;
+                            }
                             if let Some((segment, total)) = r.segment {
                                 if total <= 0 || segment < 0 || segment >= total {
                                     return Err(StorageError::Validation(
@@ -236,6 +315,11 @@ impl TikvEngine {
                                 }
                             }
                             if let Some(c) = &r.condition {
+                                if let Some(main) = &c.sk_condition
+                                    && !matches_sort(&item, main, &r.maps)?
+                                {
+                                    continue;
+                                }
                                 let mut matches = true;
                                 for (p, v) in &c.extra_sk_conditions {
                                     let Some(actual) = item.get(path_name(p, &r.maps)?) else {

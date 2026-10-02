@@ -9,13 +9,25 @@
 //! TiKV and a deterministic transactional reference store in contract tests.
 //! See the crate README for the module contracts and operational limits.
 
+#[cfg(feature = "client")]
+pub mod backend;
+pub mod backup;
+pub mod bootstrap;
+#[cfg(feature = "client")]
+mod runtime;
+#[cfg(feature = "client")]
+pub use backend::backend;
+pub mod catalog;
 pub mod codec;
 pub mod config;
 pub mod data;
 pub mod engine;
 pub mod index;
 pub mod kv;
+pub mod maintenance;
+pub mod metadata;
 pub mod query;
 pub mod stream;
 pub mod table;
+pub mod ttl;
 pub use engine::TikvEngine;

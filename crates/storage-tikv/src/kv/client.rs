@@ -33,12 +33,18 @@ impl Store for TikvStore {
     fn begin(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
         Box::pin(async move {
             let tx = self.client.begin_optimistic().await.map_err(transport)?;
-            Ok(Box::new(Tx { inner: Some(tx) }) as Box<dyn Transaction>)
+            Ok(Box::new(Tx {
+                inner: Some(tx),
+                reads: Default::default(),
+                writes: false,
+            }) as Box<dyn Transaction>)
         })
     }
 }
 struct Tx {
     inner: Option<tikv_client::Transaction>,
+    reads: std::collections::BTreeSet<Vec<u8>>,
+    writes: bool,
 }
 impl Drop for Tx {
     fn drop(&mut self) {
@@ -64,13 +70,24 @@ fn conflict(e: &tikv_client::Error) -> bool {
     }
 }
 impl Transaction for Tx {
+    fn get_snapshot(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
+        Box::pin(async move {
+            self.inner
+                .as_mut()
+                .ok_or_else(|| Error::Transport("closed transaction".into()))?
+                .get(key)
+                .await
+                .map_err(transport)
+        })
+    }
+
     fn get(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
         Box::pin(async move {
             let tx = self
                 .inner
                 .as_mut()
                 .ok_or_else(|| Error::Transport("closed transaction".into()))?;
-            tx.lock_keys([key.clone()]).await.map_err(transport)?;
+            self.reads.insert(key.clone());
             tx.get(key).await.map_err(transport)
         })
     }
@@ -95,8 +112,8 @@ impl Transaction for Tx {
             } else {
                 tx.scan(range, limit).await.map_err(transport)?.collect()
             };
-            let keys: Vec<_> = rows.iter().map(|r| r.key().clone()).collect();
-            tx.lock_keys(keys).await.map_err(transport)?;
+            self.reads
+                .extend(rows.iter().map(|r| Vec::<u8>::from(r.key().clone())));
             Ok(rows
                 .into_iter()
                 .map(|r| (Vec::<u8>::from(r.key().clone()), r.value().clone()))
@@ -105,6 +122,7 @@ impl Transaction for Tx {
     }
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            self.writes = true;
             self.inner
                 .as_mut()
                 .ok_or_else(|| Error::Transport("closed transaction".into()))?
@@ -115,6 +133,7 @@ impl Transaction for Tx {
     }
     fn delete(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            self.writes = true;
             self.inner
                 .as_mut()
                 .ok_or_else(|| Error::Transport("closed transaction".into()))?
@@ -137,6 +156,11 @@ impl Transaction for Tx {
                 .inner
                 .as_mut()
                 .ok_or_else(|| Error::Transport("closed transaction".into()))?;
+            if self.writes {
+                tx.lock_keys(self.reads.iter().cloned().collect::<Vec<_>>())
+                    .await
+                    .map_err(transport)?;
+            }
             match tx.commit().await {
                 Ok(_) => {
                     self.inner.take();

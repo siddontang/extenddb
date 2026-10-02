@@ -5,8 +5,8 @@
 //!
 //! Entries include the complete base key after the index key, preserving all
 //! duplicates and making forward/reverse pagination exact inverses. Sparse
-//! items are omitted. LSIs and GSIs use the same representation; orchestration
-//! chooses synchronous application or the durable queue. Backfill writes use
+//! items are omitted. LSIs and GSIs use the same representation and are maintained
+//! atomically with the base item. Backfill writes use
 //! the same helpers as ordinary writes.
 
 use crate::{TikvEngine, codec, kv};
@@ -93,10 +93,14 @@ pub async fn apply(
     old: Option<&Item>,
     new: Option<&Item>,
 ) -> Result<(), StorageError> {
-    if let Some(item) = old
-        && let Some(key) = entry_key(engine, table_id, index, item, base)?
-    {
-        kv::delete(tx, key).await?;
+    if let Some(item) = old {
+        match entry_key(engine, table_id, index, item, base) {
+            Ok(Some(key)) => kv::delete(tx, key).await?,
+            // Online index creation skips pre-existing invalid key values.
+            // Such an item has no old entry, but must remain repairable/deletable.
+            Ok(None) | Err(StorageError::Validation(_)) => {}
+            Err(error) => return Err(error),
+        }
     }
     if let Some(item) = new
         && let Some(key) = entry_key(engine, table_id, index, item, base)?

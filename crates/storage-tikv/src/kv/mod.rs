@@ -36,6 +36,9 @@ pub enum Error {
 
 /// A transaction owns its snapshot and buffers mutations until commit.
 pub trait Transaction: Send {
+    /// Snapshot read without a commit dependency. Only use when another guard
+    /// explicitly fences the decision (e.g. striped table-schema guards).
+    fn get_snapshot(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>>;
     fn get(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>>;
     /// Scan `[start,end)`, in the requested direction; limit is always bounded.
     fn scan(
@@ -67,7 +70,7 @@ impl Database {
     pub fn new(store: Arc<dyn Store>) -> Self {
         Self {
             store,
-            max_attempts: 8,
+            max_attempts: 64,
         }
     }
     /// Override the bounded conflict budget (at least one attempt).
@@ -98,13 +101,18 @@ impl Database {
                         return Err(storage_error(e));
                     }
                 },
+                Err(StorageError::TransactionConflict(_)) => {
+                    tx.rollback().await.map_err(storage_error)?;
+                }
                 Err(e) => {
                     tx.rollback().await.map_err(storage_error)?;
                     return Err(e);
                 }
             }
             if attempt + 1 < self.max_attempts {
-                tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+                let ceiling = 1u64 << attempt.min(8);
+                let delay = rand::random::<u64>() % (ceiling + 1);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
         }
         Err(StorageError::TransactionConflict(
@@ -184,4 +192,16 @@ pub async fn all(tx: &mut dyn Transaction, prefix_key: Vec<u8>) -> Result<Vec<Pa
         }
     }
     Ok(out)
+}
+
+/// Read document data without a dependency; caller must supply its own fence.
+pub async fn snapshot_get<T: DeserializeOwned>(
+    tx: &mut dyn Transaction,
+    key: Vec<u8>,
+) -> Result<Option<T>, StorageError> {
+    tx.get_snapshot(key)
+        .await
+        .map_err(storage_error)?
+        .map(|b| decode(&b))
+        .transpose()
 }

@@ -21,6 +21,8 @@ const SHARDS: usize = 16;
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Stream {
     pub account: String,
+    #[serde(default)]
+    pub account_generation: String,
     pub arn: String,
     pub label: String,
     pub table_name: String,
@@ -81,6 +83,13 @@ impl TikvEngine {
             }
             let stream = Stream {
                 account: t.account.clone(),
+                account_generation: kv::get::<crate::catalog::Account>(
+                    tx,
+                    self.key(&["account", &t.account]),
+                )
+                .await?
+                .ok_or_else(|| StorageError::TableNotFound(t.account.clone()))?
+                .generation,
                 arn: arn.clone(),
                 label: label.clone(),
                 table_name: t.description.table_name.clone(),
@@ -126,7 +135,7 @@ impl TikvEngine {
         let Some(arn) = &t.description.latest_stream_arn else {
             return Ok(());
         };
-        let Some(stream) = kv::get::<Stream>(tx, self.key(&["stream", arn])).await? else {
+        let Some(stream) = kv::snapshot_get::<Stream>(tx, self.key(&["stream", arn])).await? else {
             return Err(StorageError::Internal("Missing stream generation".into()));
         };
         if !stream.enabled {
@@ -200,7 +209,8 @@ impl TikvEngine {
         let s: Stream = kv::get(tx, self.key(&["stream", arn]))
             .await?
             .ok_or_else(|| StorageError::TableNotFound(arn.into()))?;
-        if s.account != account {
+        let owner = kv::get::<crate::catalog::Account>(tx, self.key(&["account", account])).await?;
+        if s.account != account || owner.is_none_or(|a| a.generation != s.account_generation) {
             return Err(StorageError::TableNotFound(arn.into()));
         }
         Ok(s)
@@ -226,6 +236,7 @@ impl StreamEngine for TikvEngine {
                         if owner.account != a {
                             return Err(StorageError::TableNotFound(s));
                         }
+                        e.owned_stream(tx, &a, &owner.arn).await?;
                         let k = e.key(&["records", &s, &r.dynamodb.sequence_number]);
                         if kv::get::<StreamRecord>(tx, k.clone()).await?.is_some() {
                             return Err(StorageError::Validation(
@@ -256,8 +267,17 @@ impl StreamEngine for TikvEngine {
                     let (e, a, s, after) = (self.clone(), a.clone(), s.clone(), after.clone());
                     Box::pin(async move {
                         let owner: Option<ShardOwner> = kv::get(tx, e.key(&["shard", &s])).await?;
-                        if owner.is_none_or(|o| o.account != a) {
-                            return Ok((vec![], None));
+                        let Some(owner) = owner.filter(|o| o.account == a) else {
+                            return Err(StorageError::Validation("Invalid ShardIterator".into()));
+                        };
+                        match e.owned_stream(tx, &a, &owner.arn).await {
+                            Ok(_) => {}
+                            Err(StorageError::TableNotFound(_)) => {
+                                return Err(StorageError::Validation(
+                                    "Invalid ShardIterator".into(),
+                                ));
+                            }
+                            Err(err) => return Err(err),
                         }
                         let p = e.key(&["records", &s]);
                         let start = if let Some(after) = after {
@@ -362,10 +382,16 @@ impl StreamEngine for TikvEngine {
                 .run(|tx| {
                     let (e, a, t, start) = (self.clone(), a.clone(), t.clone(), start.clone());
                     Box::pin(async move {
+                        let Some(account) =
+                            kv::get::<crate::catalog::Account>(tx, e.key(&["account", &a])).await?
+                        else {
+                            return Ok((vec![], None));
+                        };
                         let mut streams = vec![];
                         for (_, v) in kv::all(tx, e.key(&["stream"])).await? {
                             let s: Stream = kv::decode(&v)?;
                             if s.account == a
+                                && s.account_generation == account.generation
                                 && t.as_ref().is_none_or(|n| &s.table_name == n)
                                 && start.as_ref().is_none_or(|a| &s.arn > a)
                             {
@@ -395,24 +421,12 @@ impl StreamEngine for TikvEngine {
         &self,
         hours: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        let cutoff = self.clock.now_ms() / 1000 - hours.saturating_mul(3600);
         Box::pin(async move {
-            self.db
-                .run(|tx| {
-                    let e = self.clone();
-                    Box::pin(async move {
-                        let mut n = 0;
-                        let cutoff = e.clock.now_ms() / 1000 - hours.saturating_mul(3600);
-                        for (k, v) in kv::all(tx, e.key(&["records"])).await? {
-                            let r: StreamRecord = kv::decode(&v)?;
-                            if r.dynamodb.approximate_creation_date_time < cutoff {
-                                kv::delete(tx, k).await?;
-                                n += 1;
-                            }
-                        }
-                        Ok(n)
-                    })
-                })
-                .await
+            self.prune_step::<StreamRecord>("records", move |r| {
+                r.dynamodb.approximate_creation_date_time < cutoff
+            })
+            .await
         })
     }
     fn assign_shard(

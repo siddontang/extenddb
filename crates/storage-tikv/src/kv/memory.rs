@@ -67,6 +67,17 @@ impl Tx {
     }
 }
 impl Transaction for Tx {
+    fn get_snapshot(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
+        Box::pin(async move {
+            self.open()?;
+            Ok(self
+                .writes
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| self.snapshot.get(&key).and_then(|x| x.1.clone())))
+        })
+    }
+
     fn get(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
         Box::pin(async move {
             self.open()?;
@@ -136,6 +147,10 @@ impl Transaction for Tx {
         Box::pin(async move {
             self.open()?;
             let mut state = self.owner.lock().unwrap();
+            if self.writes.is_empty() {
+                self.closed = true;
+                return Ok(());
+            }
             if state.conflicts > 0 {
                 state.conflicts -= 1;
                 return Err(Error::Conflict);
@@ -147,6 +162,15 @@ impl Transaction for Tx {
             }
             state.clock += 1;
             let version = state.clock;
+            // TiKV's lock-only read dependencies also consume a write version.
+            // Model that contention, including absent reads, rather than making
+            // reference-store concurrency unrealistically stronger than TiKV.
+            for key in &self.reads {
+                if !self.writes.contains_key(key) {
+                    let value = self.snapshot.get(key).and_then(|v| v.1.clone());
+                    state.data.insert(key.clone(), (version, value));
+                }
+            }
             for (k, v) in std::mem::take(&mut self.writes) {
                 state.data.insert(k, (version, v));
             }

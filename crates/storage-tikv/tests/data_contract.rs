@@ -5,6 +5,7 @@
 //! Run the ignored test explicitly with `TIKV_PD_ENDPOINTS` set. A missing
 //! endpoint is a failure, never a silently skipped real-cluster check.
 #![cfg(feature = "test-support")]
+mod common;
 use extenddb_core::{
     expression::{self, ExpressionMaps},
     types::*,
@@ -20,6 +21,11 @@ fn item(pk: &str, sk: &str) -> Item {
         .unwrap()
 }
 async fn setup(e: &TikvEngine) -> TableKeyInfo {
+    use extenddb_storage::management_store::ManagementStore;
+    extenddb_storage_tikv::catalog::TikvCatalog::new(e.clone())
+        .create_account("111111111111", "data-test")
+        .await
+        .unwrap();
     let input=serde_json::from_value(serde_json::json!({"TableName":"items","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"},{"AttributeName":"g","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"gsi","KeySchema":[{"AttributeName":"g","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}})).unwrap();
     e.create_table("111111111111", input).await.unwrap();
     e.table_key_info("111111111111", "items").await.unwrap()
@@ -193,9 +199,7 @@ async fn contract(e: TikvEngine) {
         assert!(
             e.get_stream_records("222222222222", &shard.shard_id, None, 100)
                 .await
-                .unwrap()
-                .0
-                .is_empty()
+                .is_err()
         );
         assert!(
             r.windows(2)
@@ -220,6 +224,89 @@ async fn contract(e: TikvEngine) {
         scanned.extend(rows);
     }
     assert_eq!(scanned.len(), 5);
+    multipart_contract(&e).await;
+}
+
+async fn multipart_contract(e: &TikvEngine) {
+    let input = serde_json::from_value(serde_json::json!({
+        "TableName":"multipart", "BillingMode":"PAY_PER_REQUEST",
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        "AttributeDefinitions":[
+            {"AttributeName":"pk","AttributeType":"S"}, {"AttributeName":"g","AttributeType":"S"},
+            {"AttributeName":"h","AttributeType":"S"}, {"AttributeName":"s1","AttributeType":"S"},
+            {"AttributeName":"s2","AttributeType":"N"}],
+        "GlobalSecondaryIndexes":[{"IndexName":"compound", "Projection":{"ProjectionType":"ALL"},
+            "KeySchema":[{"AttributeName":"g","KeyType":"HASH"}, {"AttributeName":"h","KeyType":"HASH"},
+                {"AttributeName":"s1","KeyType":"RANGE"}, {"AttributeName":"s2","KeyType":"RANGE"}]}]
+    })).unwrap();
+    e.create_table("111111111111", input).await.unwrap();
+    let mut info = e.table_key_info("111111111111", "multipart").await.unwrap();
+    for (first, second) in [("a", "2"), ("a", "3"), ("a", "10"), ("b", "2")] {
+        let item = serde_json::from_value(serde_json::json!({
+            "pk":{"S":format!("{first}{second}")}, "g":{"S":"g"}, "h":{"S":"h"},
+            "s1":{"S":first}, "s2":{"N":second}
+        }))
+        .unwrap();
+        e.put_item(&info, item, false, None, &ExpressionMaps::default(), None)
+            .await
+            .unwrap();
+    }
+    info.key_schema = info.global_secondary_indexes[0].key_schema.clone();
+    let mut maps = ExpressionMaps::default();
+    for (name, value) in [
+        ("g", AttributeValue::S("g".into())),
+        ("h", AttributeValue::S("h".into())),
+        ("a", AttributeValue::S("a".into())),
+        ("lo", AttributeValue::N("2".into())),
+        ("hi", AttributeValue::N("3".into())),
+    ] {
+        maps.values.insert(name.into(), value);
+    }
+    for (text, expected) in [
+        (
+            "g = :g AND h = :h AND s1 = :a AND s2 BETWEEN :lo AND :hi",
+            vec!["a2", "a3"],
+        ),
+        ("h = :h AND g = :g AND s2 = :lo AND s1 = :a", vec!["a2"]),
+        ("g = :g AND h = :h AND s2 = :lo", vec!["a2", "b2"]),
+    ] {
+        let mut condition =
+            expression::parse_key_condition(&expression::tokenize(text).unwrap()).unwrap();
+        condition
+            .resolve_multipart(&["g", "h"], &maps.names)
+            .unwrap();
+        for forward in [true, false] {
+            let mut cursor = None;
+            let mut found = vec![];
+            loop {
+                let (rows, next) = e
+                    .query(
+                        &info,
+                        &condition,
+                        &maps,
+                        forward,
+                        Some(1),
+                        cursor.as_ref(),
+                        Some("compound"),
+                    )
+                    .await
+                    .unwrap();
+                found.extend(rows.into_iter().map(|row| row["pk"].clone()));
+                cursor = next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            let mut want: Vec<_> = expected
+                .iter()
+                .map(|v| AttributeValue::S((*v).into()))
+                .collect();
+            if !forward {
+                want.reverse();
+            }
+            assert_eq!(found, want, "{text}, forward={forward}");
+        }
+    }
 }
 #[tokio::test]
 async fn memory_data_contract() {
@@ -230,20 +317,7 @@ async fn memory_data_contract() {
 #[tokio::test]
 #[ignore = "requires dedicated TiKV/PD cluster; set TIKV_PD_ENDPOINTS"]
 async fn real_tikv_data_contract() {
-    let endpoints = std::env::var("TIKV_PD_ENDPOINTS").expect("set TIKV_PD_ENDPOINTS");
-    let mut config = extenddb_storage_tikv::config::TikvConfig::default();
-    config.pd_endpoints = endpoints.split(',').map(str::to_owned).collect();
-    config.namespace = format!("test_{}", uuid::Uuid::new_v4().simple());
-    let config = config.validated().unwrap();
-    contract(
-        TikvEngine::new(
-            config.connect().await.unwrap(),
-            &config.namespace,
-            "us-east-1",
-        )
-        .unwrap(),
-    )
-    .await;
+    common::real_contract(contract).await;
 }
 
 #[tokio::test]

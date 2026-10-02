@@ -19,7 +19,8 @@ pub struct TikvConfig {
     pub ca_path: Option<String>,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
-    pub request_timeout_seconds: u64,
+    #[serde(deserialize_with = "extenddb_storage::config::string_coerce::u32")]
+    pub request_timeout_seconds: u32,
     #[serde(skip)]
     pub(crate) descriptor: String,
 }
@@ -88,9 +89,9 @@ impl TikvConfig {
     pub async fn connect(&self) -> Result<std::sync::Arc<dyn crate::kv::Store>, StorageError> {
         let validated = self.clone().validated()?;
         let mut config = tikv_client::Config::default()
-            .with_timeout(std::time::Duration::from_secs(
+            .with_timeout(std::time::Duration::from_secs(u64::from(
                 validated.request_timeout_seconds,
-            ))
+            )))
             .with_grpc_max_decoding_message_size(128 * 1024 * 1024);
         if let (Some(ca), Some(cert), Some(key)) = (
             &validated.ca_path,
@@ -126,6 +127,23 @@ impl StorageConfig for TikvConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn environment_string_timeout_is_validated() {
+        let config: TikvConfig =
+            serde_json::from_value(serde_json::json!({"request_timeout_seconds":"30"})).unwrap();
+        assert_eq!(config.validated().unwrap().request_timeout_seconds, 30);
+        for value in ["0", "-1", "4294967296", "invalid"] {
+            assert!(
+                serde_json::from_value::<TikvConfig>(
+                    serde_json::json!({"request_timeout_seconds":value}),
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))
+                .and_then(TikvConfig::validated)
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn descriptor_roundtrip_preserves_namespace_and_tls() {
         let c = TikvConfig {

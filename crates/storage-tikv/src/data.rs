@@ -78,6 +78,7 @@ impl TikvEngine {
         }
         .map_err(|e| StorageError::Validation(e.to_string()))?;
         let key = self.item_key(&info, &op.item)?;
+        self.protect_table(tx, &table, &key).await?;
         let old: Option<Item> = kv::get(tx, key.clone()).await?;
         if let Some(condition) = &op.condition {
             let empty = Item::new();
@@ -133,25 +134,7 @@ impl TikvEngine {
             )
             .await?;
         }
-        // TTL candidates are ordered by expiration and include the full base key.
-        if let Some(attribute) = &table.ttl_attribute {
-            for (image, insert) in [(old.as_ref(), false), (new.as_ref(), true)] {
-                if let Some(item) = image
-                    && let Some(AttributeValue::N(n)) = item.get(attribute)
-                    && let Ok(expiry) = n.parse::<i64>()
-                    && expiry >= 0
-                {
-                    let mut ttl = self.key(&["data", &info.table_id, "ttl"]);
-                    ttl.extend_from_slice(&(expiry as u64).to_be_bytes());
-                    codec::item_key(&mut ttl, item, &info.key_schema)?;
-                    if insert {
-                        kv::put(tx, ttl, &extract_key(item, &info.key_schema)).await?;
-                    } else {
-                        kv::delete(tx, ttl).await?;
-                    }
-                }
-            }
-        }
+        crate::ttl::apply(self, tx, &table, old.as_ref(), new.as_ref()).await?;
         if old != new {
             self.capture(tx, &table, old.as_ref(), new.as_ref(), op.stream.as_ref())
                 .await?;
@@ -159,6 +142,11 @@ impl TikvEngine {
         Ok((old, new))
     }
     async fn write(&self, op: Mutation) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        let _admission = self
+            .admit_writes([self
+                .item_key(&op.info, &op.item)
+                .unwrap_or_else(|_| self.key(&["table", &op.info.table_id]))])
+            .await;
         self.db
             .run(|tx| {
                 let (e, op) = (self.clone(), op.clone());
@@ -318,15 +306,27 @@ impl DataEngine for TikvEngine {
                 .run(|tx| {
                     let (e, ops) = (self.clone(), ops.clone());
                     Box::pin(async move {
+                        let reasons: Vec<_> = ops
+                            .iter()
+                            .map(|(info, key)| {
+                                match validation::validate_key_only(
+                                    key,
+                                    &info.key_schema,
+                                    &info.attribute_definitions,
+                                ) {
+                                    Ok(()) => CancellationReason::none(),
+                                    Err(err) => {
+                                        CancellationReason::validation_error(err.to_string())
+                                    }
+                                }
+                            })
+                            .collect();
+                        if reasons.iter().any(|r| r.code != "None") {
+                            return Err(StorageError::TransactionCanceled(reasons));
+                        }
                         let mut out = vec![];
                         for (info, key) in ops {
                             e.live_table(tx, &info).await?;
-                            validation::validate_key_only(
-                                &key,
-                                &info.key_schema,
-                                &info.attribute_definitions,
-                            )
-                            .map_err(|e| StorageError::Validation(e.to_string()))?;
                             out.push(kv::get(tx, e.item_key(&info, &key)?).await?);
                         }
                         Ok(out)
@@ -422,12 +422,26 @@ impl DataEngine for TikvEngine {
             )
         });
         Box::pin(async move {
+            let _admission = self
+                .admit_writes(ops.iter().map(|op| {
+                    self.item_key(&op.info, &op.item)
+                        .unwrap_or_else(|_| self.key(&["table", &op.info.table_id]))
+                }))
+                .await;
             self.db
                 .run(|tx| {
                     let (e, ops, token) = (self.clone(), ops.clone(), token.clone());
                     Box::pin(async move {
                         if let Some((a, t, f)) = &token {
-                            let key = e.key(&["token", a, t]);
+                            let account = kv::snapshot_get::<crate::catalog::Account>(
+                                tx,
+                                e.key(&["account", a]),
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                StorageError::Validation("Account does not exist".into())
+                            })?;
+                            let key = e.key(&["token", a, &account.generation, t]);
                             if let Some(prior) = kv::get::<Token>(tx, key.clone()).await?
                                 && prior.created_ms + 600_000 > e.clock.now_ms()
                             {
@@ -486,22 +500,12 @@ impl DataEngine for TikvEngine {
         &self,
         max_age: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        let cutoff = self
+            .clock
+            .now_ms()
+            .saturating_sub(max_age.saturating_mul(1000));
         Box::pin(async move {
-            self.db
-                .run(|tx| {
-                    let e = self.clone();
-                    Box::pin(async move {
-                        let mut count = 0;
-                        for (k, v) in kv::all(tx, e.key(&["token"])).await? {
-                            let t: Token = kv::decode(&v)?;
-                            if t.created_ms + max_age.saturating_mul(1000) <= e.clock.now_ms() {
-                                kv::delete(tx, k).await?;
-                                count += 1;
-                            }
-                        }
-                        Ok(count)
-                    })
-                })
+            self.prune_step::<Token>("token", move |t| t.created_ms <= cutoff)
                 .await
         })
     }

@@ -22,11 +22,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
     pub account: String,
+    #[serde(default)]
+    pub fence_generation: u64,
     pub description: TableDescription,
     pub indexes: Vec<Index>,
     pub transition_at: i64,
     pub ttl_attribute: Option<String>,
     pub ttl_ready: bool,
+    #[serde(default)]
+    pub ttl_cursor: Option<Vec<u8>>,
+    #[serde(default)]
+    pub ttl_generation: String,
 }
 impl Table {
     pub fn key_info(&self) -> TableKeyInfo {
@@ -126,7 +132,7 @@ impl TikvEngine {
         tx: &mut dyn kv::Transaction,
         info: &TableKeyInfo,
     ) -> Result<Table, StorageError> {
-        let t: Table = kv::get(tx, self.key(&["table", &info.table_id]))
+        let t: Table = kv::snapshot_get(tx, self.key(&["table", &info.table_id]))
             .await?
             .ok_or_else(|| StorageError::TableNotFound(info.table_name.clone()))?;
         if t.account != info.account_id || t.description.table_name != info.table_name {
@@ -142,7 +148,28 @@ impl TikvEngine {
         tx: &mut dyn kv::Transaction,
         t: &Table,
     ) -> Result<(), StorageError> {
-        kv::put(tx, self.key(&["table", &t.description.table_id]), t).await
+        let key = self.key(&["table", &t.description.table_id]);
+        let old: Option<Table> = kv::get(tx, key.clone()).await?;
+        let mut t = t.clone();
+        let changed = match &old {
+            None => true,
+            Some(old) => schema_fingerprint(old)? != schema_fingerprint(&t)?,
+        };
+        t.fence_generation = old.as_ref().map_or(0, |t| t.fence_generation);
+        if changed {
+            t.fence_generation = t.fence_generation.checked_add(1).ok_or_else(|| {
+                StorageError::Internal("Table schema generation exhausted".into())
+            })?;
+            for slot in 0..FENCE_SLOTS {
+                kv::put(
+                    tx,
+                    self.fence_key(&t.description.table_id, slot),
+                    &t.fence_generation,
+                )
+                .await?;
+            }
+        }
+        kv::put(tx, key, &t).await
     }
     pub(crate) async fn tables(
         &self,
@@ -171,6 +198,12 @@ impl TableEngine for TikvEngine {
                     Box::pin(async move {
                         if input.vector_indexes.as_ref().is_some_and(|v| !v.is_empty()) {
                             return Err(StorageError::Unsupported("Vector indexes".into()));
+                        }
+                        if kv::get::<crate::catalog::Account>(tx, e.key(&["account", &a]))
+                            .await?
+                            .is_none()
+                        {
+                            return Err(StorageError::Validation("Account does not exist".into()));
                         }
                         let map = e.key(&["tables", &a, &input.table_name]);
                         if kv::get::<String>(tx, map.clone()).await?.is_some() {
@@ -249,11 +282,14 @@ impl TableEngine for TikvEngine {
                         };
                         let mut t = Table {
                             account: a,
+                            fence_generation: 0,
                             description,
                             indexes,
                             transition_at: now + delay,
                             ttl_attribute: None,
                             ttl_ready: false,
+                            ttl_cursor: None,
+                            ttl_generation: String::new(),
                         };
                         e.configure_stream(tx, &mut t).await?;
                         kv::put(tx, map, &id).await?;
@@ -510,5 +546,101 @@ impl TableEngine for TikvEngine {
             })
             .await
         })
+    }
+}
+
+/// Separate read-dependency slots prevent unrelated item writes from locking
+/// the same metadata key. Every schema change updates all slots atomically.
+pub(crate) const FENCE_SLOTS: usize = 256;
+fn schema_fingerprint(t: &Table) -> Result<Vec<u8>, StorageError> {
+    serde_json::to_vec(&(
+        &t.description.key_schema,
+        &t.description.attribute_definitions,
+        &t.description.table_status,
+        &t.description.stream_specification,
+        &t.description.latest_stream_arn,
+        &t.ttl_attribute,
+        &t.ttl_generation,
+        t.indexes
+            .iter()
+            .map(|i| (&i.id, &i.name, &i.schema, &i.projection))
+            .collect::<Vec<_>>(),
+    ))
+    .map_err(|e| StorageError::Internal(e.to_string()))
+}
+impl TikvEngine {
+    pub(crate) fn fence_key(&self, id: &str, slot: usize) -> Vec<u8> {
+        self.key(&["data", id, "fence", &format!("{slot:03}")])
+    }
+    pub(crate) async fn protect_table(
+        &self,
+        tx: &mut dyn kv::Transaction,
+        t: &Table,
+        item_key: &[u8],
+    ) -> Result<(), StorageError> {
+        let slot = crate::query::stable_hash(item_key) as usize % FENCE_SLOTS;
+        let version: u64 = kv::get(tx, self.fence_key(&t.description.table_id, slot))
+            .await?
+            .unwrap_or(0);
+        if version != t.fence_generation {
+            return Err(StorageError::TransactionConflict(
+                "Table schema changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fencing_tests {
+    use super::*;
+    use crate::{
+        catalog::TikvCatalog,
+        data::{Change, Mutation},
+        kv::{Store, Transaction, memory::MemoryStore},
+    };
+    use extenddb_core::expression::ExpressionMaps;
+    use extenddb_storage::management_store::ManagementStore;
+    use std::sync::Arc;
+    #[tokio::test]
+    async fn schema_change_fences_old_writes_without_serializing_distinct_slots() {
+        let store = Arc::new(MemoryStore::default());
+        let e = TikvEngine::new(store.clone(), "fencing", "us-east-1").unwrap();
+        TikvCatalog::new(e.clone())
+            .create_account("111111111111", "test")
+            .await
+            .unwrap();
+        let input=serde_json::from_value(serde_json::json!({"TableName":"items","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"})).unwrap();
+        e.create_table("111111111111", input).await.unwrap();
+        let info = e.table_key_info("111111111111", "items").await.unwrap();
+        async fn stage(e: &TikvEngine, tx: &mut dyn Transaction, info: &TableKeyInfo, pk: &str) {
+            let item: Item = serde_json::from_value(serde_json::json!({"pk":{"S":pk}})).unwrap();
+            e.mutate(
+                tx,
+                &Mutation {
+                    info: info.clone(),
+                    item,
+                    condition: None,
+                    maps: ExpressionMaps::default(),
+                    stream: None,
+                    change: Change::Put,
+                    ccf: ReturnValuesOnConditionCheckFailure::None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut left = store.begin().await.unwrap();
+        let mut right = store.begin().await.unwrap();
+        stage(&e, left.as_mut(), &info, "a").await;
+        stage(&e, right.as_mut(), &info, "b").await;
+        left.commit().await.unwrap();
+        right.commit().await.unwrap();
+        let mut stale = store.begin().await.unwrap();
+        stage(&e, stale.as_mut(), &info, "c").await;
+        let update=serde_json::from_value(serde_json::json!({"TableName":"items","StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}})).unwrap();
+        e.update_table("111111111111", update).await.unwrap();
+        assert!(matches!(stale.commit().await, Err(kv::Error::Conflict)));
+        stale.rollback().await.unwrap();
     }
 }

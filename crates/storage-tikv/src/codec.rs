@@ -10,7 +10,6 @@
 //! Numeric components use canonical arbitrary-precision decimal encodings,
 //! adapted from the SQLite backend; numbers never pass through an `f64`.
 
-use base64::Engine;
 use bigdecimal::BigDecimal;
 use extenddb_core::types::{AttributeValue, Item, KeySchemaElement};
 use extenddb_storage::error::StorageError;
@@ -51,9 +50,7 @@ pub fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 pub fn scalar(value: &AttributeValue) -> Result<Vec<u8>, StorageError> {
     match value {
         AttributeValue::S(s) => Ok(s.as_bytes().to_vec()),
-        AttributeValue::B(s) => base64::engine::general_purpose::STANDARD
-            .decode(s)
-            .map_err(|_| StorageError::Validation("Invalid binary key".into())),
+        AttributeValue::B(bytes) => Ok(bytes.clone()),
         AttributeValue::N(s) => {
             let n: BigDecimal = s
                 .parse()
@@ -145,6 +142,17 @@ mod tests {
             let a=BigDecimal::new(a.into(),sa); let b=BigDecimal::new(b.into(),sb);
             prop_assert_eq!(a.cmp(&b),number(&a).cmp(&number(&b)));
         }
+    }
+    #[test]
+    fn binary_attribute_bytes_are_not_base64_decoded_twice() {
+        assert_eq!(
+            scalar(&AttributeValue::B(vec![0, 1, 255])).unwrap(),
+            vec![0, 1, 255]
+        );
+        assert_eq!(
+            scalar(&AttributeValue::B(b"YWJj".to_vec())).unwrap(),
+            b"YWJj"
+        );
     }
     #[test]
     fn tuples_are_unambiguous() {
