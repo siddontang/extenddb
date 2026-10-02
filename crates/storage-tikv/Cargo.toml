@@ -1,0 +1,39 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-storage-tikv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Modular transactional TiKV backend for ExtendDB"
+
+[features]
+default = []
+client = ["dep:tikv-client"]
+test-support = []
+
+[dependencies]
+extenddb-core.workspace = true
+extenddb-storage.workspace = true
+extenddb-auth.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+uuid.workspace = true
+bigdecimal.workspace = true
+base64.workspace = true
+rand.workspace = true
+bcrypt.workspace = true
+aes-gcm.workspace = true
+zeroize.workspace = true
+tikv-client = { version = "=0.4.0", optional = true, default-features = false }
+
+[dev-dependencies]
+proptest = "1"
