@@ -111,3 +111,29 @@ pub fn check_redundant_parens(tokens: &[Token]) -> Result<(), String> {
 fn validation_err(msg: &str) -> DynamoDbError {
     DynamoDbError::ValidationException(format!("Invalid expression: {msg}"))
 }
+
+/// Check nesting iteratively before entering a recursive update parser. Count
+/// unmatched opens as well, so malformed input cannot overflow before a syntax
+/// error is discovered. Width (many sibling calls) does not consume depth.
+pub(super) fn check_parenthesis_depth(
+    tokens: &[Token],
+    max_depth: usize,
+    kind: &str,
+) -> Result<(), DynamoDbError> {
+    let mut depth: usize = 0;
+    for token in tokens {
+        match token {
+            Token::LParen => {
+                depth += 1;
+                if depth > max_depth {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "Invalid {kind}: expression nesting depth exceeded"
+                    )));
+                }
+            }
+            Token::RParen => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}

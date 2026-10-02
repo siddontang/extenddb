@@ -47,7 +47,8 @@ pub struct LimitsConfig {
     /// raw text before `#name` / `:value` substitution (DynamoDB: 4096).
     #[serde(default = "default_max_expression_length_bytes")]
     pub max_expression_length_bytes: usize,
-    /// Maximum nesting depth in condition expressions (parentheses, NOT, AND/OR).
+    /// Maximum recursive nesting in condition expressions (groups, NOT and
+    /// functions) and update expressions (groups and functions).
     #[serde(default = "default_max_expression_depth")]
     pub max_expression_depth: usize,
     /// Maximum policy document size in bytes (before JSON parsing).

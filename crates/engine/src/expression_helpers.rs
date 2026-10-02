@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    parse_condition_with_depth_limit, parse_key_condition, parse_projection,
+    parse_update_from_with_depth_limit, tokenize_for, tokenize_with_limit,
+    validate_no_reserved_words, validate_ordering_operand_types,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -114,7 +115,7 @@ pub fn parse_update_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&update_tokens)?;
         }
-        parse_update_from(&update_tokens, update_expr)
+        parse_update_from_with_depth_limit(&update_tokens, update_expr, limits.max_expression_depth)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))
 }
@@ -289,6 +290,24 @@ pub fn prefix_expression_error(err: DynamoDbError, kind: ExpressionKind) -> Dyna
 mod tests {
     use super::*;
     use extenddb_core::limits::LimitsConfig;
+
+    #[test]
+    fn configured_depth_applies_to_update_and_condition_functions() {
+        let limits = LimitsConfig {
+            max_expression_depth: 1,
+            ..LimitsConfig::default()
+        };
+        assert!(parse_update_expr("SET #a = list_append(:v, :v)", &limits).is_ok());
+        assert!(matches!(
+            parse_update_expr("SET #a = list_append(:v, list_append(:v, :v))", &limits),
+            Err(DynamoDbError::ValidationException(_))
+        ));
+        assert!(parse_condition_expr("size(#a) = :v", &limits).is_ok());
+        assert!(matches!(
+            parse_condition_expr("size(size(#a)) = :v", &limits),
+            Err(DynamoDbError::ValidationException(_))
+        ));
+    }
 
     const CONDITION_REDUNDANT: &str =
         "Invalid ConditionExpression: The expression has redundant parentheses;";

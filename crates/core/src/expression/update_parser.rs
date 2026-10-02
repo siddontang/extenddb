@@ -27,6 +27,7 @@ use crate::error::DynamoDbError;
 ///
 /// Returns `ValidationException` for syntax errors.
 pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parser_common::check_parenthesis_depth(tokens, 150, "UpdateExpression")?;
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
     })?;
@@ -74,6 +75,19 @@ pub fn parse_update_from(
     tokens: &[Token],
     source: &str,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parse_update_from_with_depth_limit(tokens, source, 150)
+}
+
+/// Parse an update expression while bounding recursive functions and groups.
+///
+/// # Errors
+/// Returns `ValidationException` for syntax errors or excessive nesting.
+pub fn parse_update_from_with_depth_limit(
+    tokens: &[Token],
+    source: &str,
+    max_depth: usize,
+) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parser_common::check_parenthesis_depth(tokens, max_depth, "UpdateExpression")?;
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
     })?;
@@ -363,6 +377,33 @@ mod tests {
     fn parse(input: &str) -> Result<Vec<UpdateAction>, DynamoDbError> {
         let tokens = tokenize(input)?;
         parse_update(&tokens)
+    }
+
+    #[test]
+    fn nested_update_operands_are_bounded_before_recursion() {
+        let text = "SET a = list_append(:v, list_append(:v, :v))";
+        let tokens = tokenize(text).unwrap();
+        assert!(parse_update_from_with_depth_limit(&tokens, text, 2).is_ok());
+        assert!(parse_update_from_with_depth_limit(&tokens, text, 1).is_err());
+        let siblings = "SET a = list_append(:v, :v), b = list_append(:v, :v)";
+        assert!(
+            parse_update_from_with_depth_limit(&tokenize(siblings).unwrap(), siblings, 1).is_ok()
+        );
+        for close in [true, false] {
+            let mut text = format!("SET a = {}:v", "list_append(:v,".repeat(200));
+            if close {
+                text.push_str(&")".repeat(200));
+            }
+            let tokens = tokenize(&text).unwrap();
+            assert!(matches!(
+                parse_update(&tokens),
+                Err(DynamoDbError::ValidationException(_))
+            ));
+            assert!(matches!(
+                parse_update_from(&tokens, &text),
+                Err(DynamoDbError::ValidationException(_))
+            ));
+        }
     }
 
     #[test]
