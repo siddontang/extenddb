@@ -139,14 +139,35 @@ batches per table/tick; name reuse follows physical cleanup. Retention handles
 256 entries per pass and persists progress so live early keys cannot starve
 later expired entries.
 
+## Vector search
+
+Vector metadata, validation, projections and backfill use the shared vector
+lifecycle contracts. The TiKV-specific modules separate deterministic scoring,
+transactional maintenance and the resumable build driver. Search takes one MVCC
+snapshot, scans the selected partition in bounded pages and retains only TopK
+hits. It supports Euclidean distance, cosine distance and dot product, hash
+partitions, inline equality filters and the standard projections. This is exact
+search with linear partition scan cost; it does not implement ANN acceleration.
+
+Writers maintain vector rows in the same transaction as base items. Online
+builds persist a cursor with each batch of at most 64 source rows, protect those
+source reads against concurrent writes, and publish ACTIVE only at end of scan.
+Index UUIDs prevent a deleted/recreated index from inheriting a stale worker.
+Snapshot scans do not accumulate write-lock dependencies for read-only search.
+
+The vector contracts run on the reference store and real TiKV, covering paging,
+concurrent item mutation during backfill, restart, stale workers, account
+isolation and backup restoration. Raw signed HTTP tests exercise all three
+metrics through the normal server. The follow-on vector check passed all 42
+TiKV unit/contracts and 15 vector HTTP checks locally.
+
 ## Backup, deployment and validation boundaries
 
 On-demand backup takes one transactional snapshot, capped at 4 MiB encoded.
 Restore atomically publishes a fresh table generation and rebuilt indexes.
 Larger snapshots fail before any backup is published. Large-table export needs
 a pinned timestamp with coordinated GC; this implementation does not pretend
-that independent scan transactions provide a consistent snapshot. PITR and
-vector search are refused explicitly.
+that independent scan transactions provide a consistent snapshot. PITR is refused explicitly.
 
 The TiDB Rust reference was read at commit
 `6a5b492097d5be084a0b1106da2c7f106c518498`, including

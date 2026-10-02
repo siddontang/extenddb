@@ -99,6 +99,19 @@ impl Transaction for Tx {
         reverse: bool,
     ) -> BoxFuture<'_, Result<Vec<Pair>, Error>> {
         Box::pin(async move {
+            let rows = self.scan_snapshot(start, end, limit, reverse).await?;
+            self.reads.extend(rows.iter().map(|(k, _)| k.clone()));
+            Ok(rows)
+        })
+    }
+    fn scan_snapshot(
+        &mut self,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: u32,
+        reverse: bool,
+    ) -> BoxFuture<'_, Result<Vec<Pair>, Error>> {
+        Box::pin(async move {
             let tx = self
                 .inner
                 .as_mut()
@@ -112,8 +125,6 @@ impl Transaction for Tx {
             } else {
                 tx.scan(range, limit).await.map_err(transport)?.collect()
             };
-            self.reads
-                .extend(rows.iter().map(|r| Vec::<u8>::from(r.key().clone())));
             Ok(rows
                 .into_iter()
                 .map(|r| (Vec::<u8>::from(r.key().clone()), r.value().clone()))

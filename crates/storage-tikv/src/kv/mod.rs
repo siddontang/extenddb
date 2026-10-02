@@ -48,6 +48,17 @@ pub trait Transaction: Send {
         limit: u32,
         reverse: bool,
     ) -> BoxFuture<'_, Result<Vec<Pair>, Error>>;
+    /// Read-only range scan without accumulating commit dependencies. A caller
+    /// that later writes must provide a separate fence for these observations.
+    fn scan_snapshot(
+        &mut self,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: u32,
+        reverse: bool,
+    ) -> BoxFuture<'_, Result<Vec<Pair>, Error>> {
+        self.scan(start, end, limit, reverse)
+    }
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), Error>>;
     fn delete(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<(), Error>>;
     fn commit(&mut self) -> BoxFuture<'_, Result<(), Error>>;

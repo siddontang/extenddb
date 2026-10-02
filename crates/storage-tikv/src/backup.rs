@@ -100,6 +100,7 @@ impl BackupEngine for TikvEngine {
                     let t = e.table_by_name(tx, &a, &n).await?;
                     if t.description.table_status != TableStatus::Active
                         || t.indexes.iter().any(|i| i.cursor.is_some())
+                        || t.vectors.iter().any(|v| v.backfilling.is_some())
                     {
                         return Err(StorageError::TableNotActive(n));
                     }
@@ -284,10 +285,19 @@ impl BackupEngine for TikvEngine {
                         i.id = uuid::Uuid::new_v4().to_string();
                         i.cursor = None;
                     }
+                    for v in &mut t.vectors {
+                        v.id = uuid::Uuid::new_v4().to_string();
+                        v.backfilling = None;
+                        v.complete = true;
+                        v.cursor.clear();
+                    }
                     t.description.item_count = backup.items.len() as i64;
                     t.description.table_size_bytes = backup.details.backup_size_bytes;
                     let info = t.key_info();
                     for item in backup.items {
+                        for v in &t.vectors {
+                            crate::vector::apply(&e, tx, &t, v, None, Some(&item)).await?;
+                        }
                         kv::put(tx, e.item_key(&info, &item)?, &item).await?;
                         for i in &t.indexes {
                             index::apply(

@@ -30,4 +30,5 @@ pub mod query;
 pub mod stream;
 pub mod table;
 pub mod ttl;
+pub mod vector;
 pub use engine::TikvEngine;

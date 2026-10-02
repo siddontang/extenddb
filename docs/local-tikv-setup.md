@@ -101,7 +101,7 @@ after failure; it is not a single atomic cluster operation.
 ## Limits before production use
 
 Read the [backend limits](../crates/storage-tikv/README.md#scope-and-deployment-limits)
-before planning a rollout. Vector search and PITR are unsupported. Backups are
+before planning a rollout. Vector search uses exact partition scans; PITR remains unsupported. Backups are
 atomic but limited to 4 MiB encoded snapshots; IAM is limited to 4 MiB per
 account. GSIs are synchronous. Existing data needs an explicit migration plan.
 
