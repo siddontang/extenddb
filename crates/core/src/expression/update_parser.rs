@@ -309,7 +309,7 @@ fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dy
     };
     if !is_set_function(&name) {
         return Err(validation_err(&format!(
-            "Invalid UpdateExpression: Function {name} is not allowed"
+            "Invalid UpdateExpression: Syntax error; function {name} is not allowed"
         )));
     }
     *pos += 1;

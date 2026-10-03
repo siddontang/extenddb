@@ -56,9 +56,15 @@ pub fn validate_query_keys(
                 return Err(invalid("Query key condition requires a constant value"));
             };
             let value = maps.resolve_value_for(reference, "KeyConditionExpression")?;
-            super::validate_key_attribute_type(name, value, definitions)?;
+            super::validate_key_attribute_type(name, value, definitions).map_err(|error| {
+                invalid(format!(
+                    "Condition parameter type does not match schema type: {error}"
+                ))
+            })?;
             if begins && !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
-                return Err(invalid("BEGINS_WITH is not supported for numeric keys"));
+                return Err(invalid(
+                    "begins_with (BEGINS_WITH) is not supported for numeric keys",
+                ));
             }
         }
         Ok(())
@@ -108,7 +114,7 @@ pub fn validate_query_filter(
                 };
                 if schema.iter().any(|key| key.attribute_name == name) {
                     return Err(invalid(format!(
-                        "Filter Expression can only contain non-primary key attributes: Primary key attribute: {name}"
+                        "Invalid FilterExpression: Filter Expression can only contain non-primary key attributes: Primary key attribute: {name}"
                     )));
                 }
             }

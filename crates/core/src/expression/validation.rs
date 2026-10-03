@@ -80,14 +80,34 @@ pub fn validate_condition_functions(
                     args.len()
                 )));
             }
-            if matches!(
-                name.as_str(),
-                "attribute_exists" | "attribute_not_exists" | "attribute_type" | "size"
-            ) && !matches!(args[0], Expr::Path(_))
+            if matches!(name.as_str(), "attribute_exists" | "attribute_not_exists")
+                && !matches!(args[0], Expr::Path(_))
             {
                 return Err(invalid(format!(
                     "Function {name} requires an attribute path"
                 )));
+            }
+            // Unlike existence tests, size and attribute_type also accept
+            // expression values. Invalid size operands are still rejected
+            // before evaluation, even in a short-circuited branch.
+            if name == "size" {
+                let supported = match &args[0] {
+                    Expr::Path(_) => true,
+                    Expr::Placeholder(reference) => matches!(
+                        maps.resolve_value_for(reference, "ConditionExpression")?,
+                        AttributeValue::S(_)
+                            | AttributeValue::B(_)
+                            | AttributeValue::SS(_)
+                            | AttributeValue::NS(_)
+                            | AttributeValue::BS(_)
+                            | AttributeValue::L(_)
+                            | AttributeValue::M(_)
+                    ),
+                    _ => false,
+                };
+                if !supported {
+                    return Err(invalid("Incorrect operand type for function size"));
+                }
             }
             if name == "attribute_type" {
                 let Expr::Placeholder(placeholder) = &args[1] else {
@@ -182,7 +202,7 @@ mod tests {
             .insert("type".into(), AttributeValue::S("DOG".into()));
         for text in [
             "attribute_exists(:type)",
-            "size(:type) = :type",
+            "size(size(absent)) = :type",
             "attribute_type(absent, :type)",
             "attribute_type(absent, other)",
             "attribute_exists(absent) OR attribute_type(absent, :type)",
@@ -198,6 +218,10 @@ mod tests {
             .insert("type".into(), AttributeValue::S("M".into()));
         let expr = parse_condition(&tokenize("attribute_type(absent, :type)").unwrap()).unwrap();
         assert!(validate_condition_functions(&expr, &maps).is_ok());
+        for text in ["attribute_type(:type, :type)", "size(:type) = :type"] {
+            let expr = parse_condition(&tokenize(text).unwrap()).unwrap();
+            assert!(validate_condition_functions(&expr, &maps).is_ok());
+        }
     }
     #[test]
     fn aliases_overlap_and_container_conflicts_are_checked() {

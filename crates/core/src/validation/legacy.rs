@@ -14,7 +14,7 @@ pub fn validate_legacy_comparison(
 ) -> Result<(), DynamoDbError> {
     let invalid = || {
         DynamoDbError::ValidationException(format!(
-            "Invalid AttributeValueList for ComparisonOperator {op}"
+            "One or more parameter values were invalid: Invalid AttributeValueList: incorrect operand type, count or bounds for ComparisonOperator {op}"
         ))
     };
     let count_ok = match op {

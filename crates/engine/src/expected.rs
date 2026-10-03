@@ -232,10 +232,18 @@ fn desugar_one(
             }
             let placeholder = next_placeholder(counter);
             values.insert(placeholder.clone(), vals[0].clone());
-            Ok(Expr::Not(Box::new(Expr::Function {
-                name: "contains".to_owned(),
-                args: vec![path.clone(), Expr::Placeholder(placeholder)],
-            })))
+            // Legacy NOT_CONTAINS is false when the attribute is absent,
+            // unlike the modern NOT contains(...) expression.
+            Ok(Expr::And(
+                Box::new(Expr::Function {
+                    name: "attribute_exists".into(),
+                    args: vec![path.clone()],
+                }),
+                Box::new(Expr::Not(Box::new(Expr::Function {
+                    name: "contains".to_owned(),
+                    args: vec![path.clone(), Expr::Placeholder(placeholder)],
+                }))),
+            ))
         }
         "IN" => {
             if vals.is_empty() {

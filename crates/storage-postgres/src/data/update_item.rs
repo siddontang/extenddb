@@ -191,7 +191,7 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
 
             // Validate post-update item size (400 KB limit)
-            validation::validate_item_size(&item, self.max_item_size_bytes)
+            validation::validate_update_item_size(&item, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
             let new_item = if return_new { Some(item.clone()) } else { None };

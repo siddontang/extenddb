@@ -56,3 +56,30 @@ def test_empty_index_key_is_request_validation(dynamodb_client, indexed_table, o
     assert "empty" in error.value.response["Error"]["Message"].lower()
     for key in ["earlier", "bad"]:
         assert "Item" not in client.get_item(TableName=name, Key={"pk": {"S": key}}, ConsistentRead=True)
+
+
+def _too_deep():
+    value = {"S": "leaf"}
+    for _ in range(32):
+        value = {"L": [value]}
+    return value
+
+
+@pytest.mark.parametrize("value,message", [
+    ({"S": "x" * (400 * 1024)}, "Item size to update has exceeded"),
+    (_too_deep(), "Nesting Levels"),
+])
+def test_invalid_updated_image_cancels_prior_writes(dynamodb_client, indexed_table, value, message):
+    client, name = dynamodb_client, indexed_table
+    with pytest.raises(ClientError) as error:
+        client.transact_write_items(TransactItems=[
+            {"Put": {"TableName": name, "Item": {"pk": {"S": "earlier"}}}},
+            {"Update": {"TableName": name, "Key": {"pk": {"S": "invalid"}},
+                        "UpdateExpression": "SET value_attr = :v", "ExpressionAttributeValues": {":v": value}}},
+        ])
+    assert error.value.response["Error"]["Code"] == "TransactionCanceledException"
+    reasons = error.value.response["CancellationReasons"]
+    assert [reason["Code"] for reason in reasons] == ["None", "ValidationError"]
+    assert message in reasons[1]["Message"]
+    for key in ["earlier", "invalid"]:
+        assert "Item" not in client.get_item(TableName=name, Key={"pk": {"S": key}}, ConsistentRead=True)

@@ -224,6 +224,24 @@ async fn contract(e: TikvEngine) {
         scanned.extend(rows);
     }
     assert_eq!(scanned.len(), 5);
+    // The same cursor succeeds in exactly one segment, even if the cursor
+    // item has since been deleted. No network lookup defines membership.
+    let cursor = item("cursor-not-stored", "7");
+    let mut accepted = 0;
+    for segment in 0..3 {
+        match e
+            .scan(&info, Some(1), Some(&cursor), Some(segment), Some(3), None)
+            .await
+        {
+            Ok(_) => accepted += 1,
+            Err(StorageError::Validation(message)) => {
+                assert!(message.contains("ExclusiveStartKey"))
+            }
+            other => panic!("unexpected segment outcome: {other:?}"),
+        }
+    }
+    assert_eq!(accepted, 1);
+
     multipart_contract(&e).await;
 }
 

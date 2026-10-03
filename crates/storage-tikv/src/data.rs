@@ -145,7 +145,12 @@ impl TikvEngine {
             }
         };
         if let Some(item) = &new {
-            validation::validate_item_size(item, self.max_item_size)
+            let validate_size = if matches!(op.change, Change::Update(_)) {
+                validation::validate_update_item_size
+            } else {
+                validation::validate_item_size
+            };
+            validate_size(item, self.max_item_size)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
             let refs: Vec<_> = table
                 .indexes

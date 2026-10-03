@@ -272,7 +272,12 @@ pub async fn handle_query(
 
     // Correct PK/SK assignment when both clauses are equality comparisons.
     // The parser can't distinguish PK from SK without the key schema.
-    let pk_attr = &query_key_info.key_schema[0].attribute_name;
+    let pk_attr = &query_key_info
+        .key_schema
+        .iter()
+        .find(|key| key.key_type == extenddb_core::types::KeyType::Hash)
+        .ok_or_else(|| DynamoDbError::InternalServerError("Missing partition key schema".into()))?
+        .attribute_name;
     key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
 
     // Validate that the partition key is actually referenced in the condition.

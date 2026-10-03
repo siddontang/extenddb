@@ -257,6 +257,14 @@ pub async fn handle_update_item(
         )
         .await
         .map_err(|e| {
+            if input.attribute_updates.is_some()
+                && let extenddb_storage::error::StorageError::Validation(message) = &e
+                && message == "An operand in the update expression has an incorrect data type"
+            {
+                return DynamoDbError::ValidationException(
+                    "Type mismatch for attribute to update".into(),
+                );
+            }
             storage_err_to_dynamo_with_ccf(e, input.return_values_on_condition_check_failure)
         })?;
 
@@ -545,7 +553,15 @@ fn desugar_attribute_updates(
                         "One or more parameter values were invalid: Value must be specified for ADD action on attribute {attr_name}"
                     ))
                 })?;
-                add_clauses.push(format!("{name_placeholder} {val_placeholder}"));
+                if matches!(value, AttributeValue::L(_)) {
+                    // The legacy API appends lists; modern ADD accepts only
+                    // numbers and sets. Desugar to SET without broadening ADD.
+                    let empty = format!(":_empty{idx}");
+                    expr_values.insert(empty.clone(), AttributeValue::L(vec![]));
+                    set_clauses.push(format!("{name_placeholder} = list_append(if_not_exists({name_placeholder}, {empty}), {val_placeholder})"));
+                } else {
+                    add_clauses.push(format!("{name_placeholder} {val_placeholder}"));
+                }
                 expr_values.insert(val_placeholder, value);
             }
             other => {

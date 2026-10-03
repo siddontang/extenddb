@@ -197,6 +197,28 @@ pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
     })
 }
 
+/// A cursor and every row use the same partition assignment. This deliberately
+/// hashes only the base table's partition key, so siblings stay together and a
+/// cursor remains verifiable after its row has been deleted.
+fn in_segment(
+    item: &Item,
+    schema: &[extenddb_core::types::KeySchemaElement],
+    segment: i64,
+    total: i64,
+) -> Result<bool, StorageError> {
+    if total <= 0 || segment < 0 || segment >= total {
+        return Err(StorageError::Validation("Invalid scan segment".into()));
+    }
+    let hashes: Vec<_> = schema
+        .iter()
+        .filter(|key| key.key_type == KeyType::Hash)
+        .cloned()
+        .collect();
+    let mut key = vec![];
+    codec::item_key(&mut key, item, &hashes)?;
+    Ok(stable_hash(&key) % total as u64 == segment as u64)
+}
+
 impl TikvEngine {
     pub(crate) async fn read(&self, req: Read) -> QueryResult {
         self.db
@@ -204,6 +226,11 @@ impl TikvEngine {
                 let (e, r) = (self.clone(), req.clone());
                 Box::pin(async move {
                     let table = e.live_table(tx, &r.info).await?;
+                    if let (Some(cursor), Some((segment, total))) = (&r.start, r.segment)
+                        && !in_segment(cursor, &table.description.key_schema, segment, total)?
+                    {
+                        return Err(StorageError::Validation("The provided ExclusiveStartKey does not belong to the requested Segment".into()));
+                    }
                     let idx = r
                         .index
                         .as_ref()
@@ -295,24 +322,10 @@ impl TikvEngine {
                                         StorageError::Internal("LSI entry has no base item".into())
                                     })?;
                             }
-                            if let Some((segment, total)) = r.segment {
-                                if total <= 0 || segment < 0 || segment >= total {
-                                    return Err(StorageError::Validation(
-                                        "Invalid scan segment".into(),
-                                    ));
-                                }
-                                let hash_schema: Vec<_> = table
-                                    .description
-                                    .key_schema
-                                    .iter()
-                                    .filter(|k| k.key_type == KeyType::Hash)
-                                    .cloned()
-                                    .collect();
-                                let mut key = vec![];
-                                codec::item_key(&mut key, &item, &hash_schema)?;
-                                if stable_hash(&key) % total as u64 != segment as u64 {
-                                    continue;
-                                }
+                            if let Some((segment, total)) = r.segment
+                                && !in_segment(&item, &table.description.key_schema, segment, total)?
+                            {
+                                continue;
                             }
                             if let Some(c) = &r.condition {
                                 if let Some(main) = &c.sk_condition

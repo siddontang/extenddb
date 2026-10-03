@@ -536,7 +536,7 @@ async fn execute_transact_write_op(
                     TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
                 // Validate post-update item size
-                validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
+                validation::validate_update_item_size(&item, max_item_size_bytes).map_err(|e| {
                     TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
                 // Secondary-index key validation on the post-update item: a type

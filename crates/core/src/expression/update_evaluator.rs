@@ -173,6 +173,10 @@ pub fn apply_update_validated(
         }
     }
     apply_update(actions, item, maps)?;
+    // Validate the stored image, including depth introduced by a document path
+    // or a copied attribute. Transactions translate this into an item-specific
+    // cancellation reason and roll back every preceding write.
+    crate::validation::validate_item_nesting_depth(item)?;
     crate::validation::validate_vector_write_changed(
         item,
         &before,

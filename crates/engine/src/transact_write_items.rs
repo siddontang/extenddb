@@ -23,8 +23,8 @@ use extenddb_core::types::{
     CancellationReason, Item, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
-    validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
+    validate_attribute_name_sizes, validate_item_nesting_depth, validate_item_size,
+    validate_key_not_empty,
 };
 
 /// Maximum number of items in a single `TransactWriteItems` request.
@@ -487,20 +487,8 @@ async fn prepare_write_op(
         extenddb_core::expression::validate_update_paths(&actions, &maps)?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
 
-        // Validate nesting depth of EAV values that get stored via SET actions.
-        {
-            let mut placeholders: Vec<String> = Vec::new();
-            for action in &actions {
-                if let extenddb_core::expression::UpdateAction::Set { value, .. } = action {
-                    extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
-                }
-            }
-            let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
-                .iter()
-                .filter_map(|name| maps.values.get(name))
-                .collect();
-            validate_attribute_values_nesting_depth(stored)?;
-        }
+        // Depth is a property of the updated image. Storage checks it after
+        // evaluation so an invalid image cancels the transaction atomically.
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
         if let Some(ref expr) = condition {
             extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(

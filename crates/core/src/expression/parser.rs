@@ -223,7 +223,7 @@ fn parse_operand(
             Ok(Expr::Path(elements))
         }
         _ => Err(validation_err(
-            "Invalid ConditionExpression: expected attribute path or value placeholder",
+            "Invalid ConditionExpression: Syntax error; expected attribute path or value placeholder",
         )),
     }
 }
@@ -250,7 +250,7 @@ fn parse_function_call(
     };
     if !is_function_name(&name) && name != "size" {
         return Err(validation_err(&format!(
-            "Invalid ConditionExpression: Function {name} is not allowed"
+            "Invalid ConditionExpression: function {name} is not allowed"
         )));
     }
     *pos += 1;
