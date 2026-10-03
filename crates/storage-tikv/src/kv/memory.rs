@@ -26,6 +26,7 @@ struct State {
     data: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)>,
     conflicts: usize,
     unknown: usize,
+    scan_writes: usize,
 }
 struct Tx {
     owner: Arc<Mutex<State>>,
@@ -33,8 +34,15 @@ struct Tx {
     reads: BTreeSet<Vec<u8>>,
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     closed: bool,
+    scanned: bool,
 }
 impl MemoryStore {
+    /// Test diagnostic: successful writing commits which included a range scan.
+    /// Useful for asserting that observational workers do not lock data rows.
+    pub fn scan_write_commits(&self) -> usize {
+        self.inner.lock().unwrap().scan_writes
+    }
+
     /// Fail this many commits before applying any writes.
     pub fn inject_conflicts(&self, n: usize) {
         self.inner.lock().unwrap().conflicts = n;
@@ -53,6 +61,7 @@ impl Store for MemoryStore {
                 reads: BTreeSet::new(),
                 writes: BTreeMap::new(),
                 closed: false,
+                scanned: false,
             }) as Box<dyn Transaction>)
         })
     }
@@ -98,6 +107,7 @@ impl Transaction for Tx {
     ) -> BoxFuture<'_, Result<Vec<Pair>, Error>> {
         Box::pin(async move {
             self.open()?;
+            self.scanned = true;
             let mut view: BTreeMap<_, _> = self
                 .snapshot
                 .iter()
@@ -160,6 +170,7 @@ impl Transaction for Tx {
                     return Err(Error::Conflict);
                 }
             }
+            state.scan_writes += usize::from(self.scanned);
             state.clock += 1;
             let version = state.clock;
             // TiKV's lock-only read dependencies also consume a write version.

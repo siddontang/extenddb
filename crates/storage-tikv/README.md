@@ -39,9 +39,11 @@ the user's TiDB Rust reference at commit
 `6a5b492097d5be084a0b1106da2c7f106c518498`, particularly
 `rust/crates/tidb-txnkv/src/driver/tikv_opener.rs` and `retry.rs`.
 The reference's vendored client requires Rust 1.93 and adds TiDB-specific APIs.
-We pin the portable published client `0.4.0` behind a feature rather than adding
-an absolute dependency on that checkout or copying its entire fork. The adapter
-is the only place a future client replacement needs to change.
+We pin published client `0.4.0` behind a feature and vendor its source with a
+narrow missing-primary lock-resolution backport. See
+[`vendor/tikv-client/EXTENDDB.md`](../../vendor/tikv-client/EXTENDDB.md) for the
+upstream provenance, exact change and removal criteria. No absolute dependency
+on the TiDB checkout is required. The adapter remains the replacement boundary.
 
 ## Tests
 
@@ -169,10 +171,16 @@ the reference MVCC store and real TiKV.
   TiKV transaction-size limits also apply, particularly with index projections;
   this is not an unbounded backup API. Legacy inline snapshots remain readable.
   IAM documents have a separate 4 MiB per-account limit.
-* Expanded compatibility testing found unresolved failures, including intermittent
-  nested `TxnNotFound` errors during concurrent control-plane writes with
-  `tikv-client 0.4.0`. These surface as unknown commit outcomes and are not blindly
-  retried. SSE configuration is not implemented. See the
+* Table statistics are observed in a read-only MVCC snapshot, then published in
+  a small transaction fenced by table id and schema generation. They are
+  approximate under concurrent item writes. This avoids locking every scanned
+  row merely to update a count; an old observation cannot reach a recreated table.
+* The nested `TxnNotFound` catalog contention failure is repaired by the audited
+  client backport and covered by fault-specific and real-cluster tests. Unknown
+  commit outcomes remain errors and are never blindly replayed.
+* SSE/KMS encryption is not implemented: CreateTable and UpdateTable explicitly
+  reject `SSESpecification.Enabled=true` before mutation. Accepting false does
+  not assert that the underlying cluster encrypts data at rest. See the
   [test report](../../docs/testing-tikv.md) before evaluating PostgreSQL replacement.
 * GSIs update synchronously; `index_propagation_delay_ms` does not introduce an
   artificial delay. Reads use fresh snapshots even when eventual consistency is
