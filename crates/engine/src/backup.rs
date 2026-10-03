@@ -269,7 +269,7 @@ pub(crate) async fn handle_restore_table_to_point_in_time(
 fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     match e {
         extenddb_storage::error::StorageError::TableNotFound(msg) => {
-            DynamoDbError::ResourceNotFoundException(msg)
+            DynamoDbError::TableNotFoundException(msg)
         }
         extenddb_storage::error::StorageError::TableAlreadyExists(msg) => {
             DynamoDbError::ResourceInUseException(msg)
@@ -307,6 +307,14 @@ mod tests {
     use serde_json::json;
 
     const ACCOUNT: &str = "123456789012";
+
+    #[test]
+    fn absent_source_table_has_the_backup_specific_error_type() {
+        let error = storage_err_to_dynamo(StorageError::TableNotFound("missing".into()));
+        assert_eq!(error.error_type(), "TableNotFoundException");
+        assert_eq!(error.status_code(), 400);
+        assert_eq!(error.message(), "missing");
+    }
 
     fn arn(account: &str) -> String {
         format!("arn:aws:dynamodb:us-east-1:{account}:table/Music/backup/01489602797149-73d8d5bc")

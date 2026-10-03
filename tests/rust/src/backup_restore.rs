@@ -86,13 +86,8 @@ async fn create_backup_non_existent_table() {
         .send()
         .await
         .unwrap_err();
-    // extenddb returns ResourceNotFoundException; real DynamoDB returns
-    // TableNotFoundException for backup operations on nonexistent tables.
     let code = err_code(&err);
-    assert!(
-        code == Some("ResourceNotFoundException") || code == Some("TableNotFoundException"),
-        "unexpected error code: {code:?}"
-    );
+    assert_eq!(code, Some("TableNotFoundException"));
 }
 
 #[tokio::test]

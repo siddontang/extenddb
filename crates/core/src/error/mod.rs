@@ -17,6 +17,10 @@ pub enum DynamoDbError {
     ValidationException(String),
     #[error("{0}")]
     ResourceNotFoundException(String),
+    /// HTTP 400: backup APIs distinguish a missing source table from other
+    /// missing resources (DescribeContinuousBackups and CreateBackup).
+    #[error("{0}")]
+    TableNotFoundException(String),
     /// SP-ERR-002: HTTP 400. Backup-specific not-found, distinct from
     /// `ResourceNotFoundException`. Returned by `DescribeBackup`, `DeleteBackup`
     /// and `RestoreTableFromBackup` for a backup ARN in the caller's account
@@ -113,6 +117,7 @@ impl DynamoDbError {
         match self {
             Self::ValidationException(_)
             | Self::ResourceNotFoundException(_)
+            | Self::TableNotFoundException(_)
             | Self::BackupNotFoundException(_)
             | Self::ResourceInUseException(_)
             | Self::LimitExceededException(_)
@@ -154,6 +159,7 @@ impl DynamoDbError {
         match self {
             Self::ValidationException(_) => "ValidationException",
             Self::ResourceNotFoundException(_) => "ResourceNotFoundException",
+            Self::TableNotFoundException(_) => "TableNotFoundException",
             Self::BackupNotFoundException(_) => "BackupNotFoundException",
             Self::ResourceInUseException(_) => "ResourceInUseException",
             Self::LimitExceededException(_) => "LimitExceededException",
@@ -220,6 +226,7 @@ impl DynamoDbError {
         match self {
             Self::ValidationException(m)
             | Self::ResourceNotFoundException(m)
+            | Self::TableNotFoundException(m)
             | Self::BackupNotFoundException(m)
             | Self::ResourceInUseException(m)
             | Self::LimitExceededException(m)
@@ -316,6 +323,7 @@ mod tests {
             (DynamoDbError::RequestTimeoutException(String::new()), 408),
             (DynamoDbError::ResourceInUseException(String::new()), 400),
             (DynamoDbError::ResourceNotFoundException(String::new()), 400),
+            (DynamoDbError::TableNotFoundException(String::new()), 400),
             (DynamoDbError::BackupNotFoundException(String::new()), 400),
             (DynamoDbError::SerializationException(String::new()), 400),
             (DynamoDbError::ServiceUnavailable(String::new()), 503),
