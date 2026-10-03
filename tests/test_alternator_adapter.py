@@ -9,6 +9,13 @@ import os
 
 import pytest
 
+
+def test_upstream_transport_matches_endpoint_without_weakening_origin_fence():
+    assert adapter.transport_options('https://localhost:8443') == ['--https']
+    assert adapter.transport_options('http://localhost:8000') == []
+    with pytest.raises(ValueError):
+        adapter.check_destination('http://localhost:8443', 'https://localhost:8443')
+
 SPEC = importlib.util.spec_from_file_location(
     'alternator_adapter', Path(__file__).resolve().parents[1] / 'devtools/alternator_adapter.py')
 adapter = importlib.util.module_from_spec(SPEC)

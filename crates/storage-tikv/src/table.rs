@@ -189,6 +189,19 @@ impl TikvEngine {
 }
 
 impl TableEngine for TikvEngine {
+    fn validate_sse_specification(
+        &self,
+        specification: Option<&serde_json::Value>,
+    ) -> Result<(), StorageError> {
+        if specification
+            .and_then(|spec| spec.get("Enabled"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Err(StorageError::Unsupported("TiKV SSE/KMS encryption".into()));
+        }
+        Ok(())
+    }
     fn create_table(
         &self,
         account: &str,
@@ -196,6 +209,7 @@ impl TableEngine for TikvEngine {
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let (engine, account) = (self.clone(), account.to_owned());
         Box::pin(async move {
+            engine.validate_sse_specification(input.sse_specification.as_ref())?;
             engine
                 .db
                 .run(|tx| {

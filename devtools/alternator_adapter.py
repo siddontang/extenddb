@@ -61,6 +61,16 @@ def check_destination(url: str, endpoint: str) -> None:
         raise ValueError('External suite attempted a request outside its isolated endpoint')
 
 
+def transport_options(endpoint: str) -> list[str]:
+    """Keep upstream URL reconstruction consistent with the isolated transport.
+
+    DescribeEndpoints rebuilds a URL from its address and pytest's https flag;
+    passing the flag prevents an accidental downgrade. The origin fence remains
+    unchanged and still rejects a different scheme, host or port.
+    """
+    return ['--https'] if origin(endpoint)[0] == 'https' else []
+
+
 @contextmanager
 def local_http_only(endpoint: str):
     """Fence both boto3 and raw requests, including redirects and new sessions."""
@@ -169,7 +179,7 @@ def main() -> int:
     LocalFixtures.pytest_fixture_setup = pytest.hookimpl(tryfirst=True)(LocalFixtures.pytest_fixture_setup)
     with local_http_only(endpoint):
         return pytest.main(['-c', str(suite / 'pytest.ini'), '--confcutdir', str(suite),
-                            '--aws', '--timeout=120', '--timeout-method=signal',
+                            '--aws', *transport_options(endpoint), '--timeout=120', '--timeout-method=signal',
                             '-q', '--tb=short', *targets, *extra], plugins=[LocalFixtures(endpoint)])
 
 

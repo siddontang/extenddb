@@ -27,6 +27,9 @@ pub async fn handle_update_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    ctx.storage
+        .validate_sse_specification(body.get("SSESpecification"))
+        .map_err(crate::create_table::storage_err_to_dynamo)?;
     // Per-member enum validation precedes everything else, including the table
     // lookup, matching the measured service ordering.
     crate::validate_enum_fields(

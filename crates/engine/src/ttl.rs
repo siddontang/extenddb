@@ -58,6 +58,17 @@ pub async fn handle_update_time_to_live(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    for field in ["AttributeName", "Enabled"] {
+        if body
+            .get("TimeToLiveSpecification")
+            .and_then(|spec| spec.get(field))
+            .is_none_or(Value::is_null)
+        {
+            return Err(DynamoDbError::ValidationException(format!(
+                "TimeToLiveSpecification.{field} is required"
+            )));
+        }
+    }
     let input: UpdateTimeToLiveInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 

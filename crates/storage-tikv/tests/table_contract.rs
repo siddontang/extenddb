@@ -29,6 +29,18 @@ async fn contract(e: TikvEngine) {
         .create_account(account, "table-contract")
         .await
         .unwrap();
+    let mut encrypted = create("unsupported-encryption");
+    encrypted.sse_specification = Some(serde_json::json!({"Enabled":true,"SSEType":"KMS"}));
+    assert!(matches!(e.create_table(account, encrypted).await,
+        Err(StorageError::Unsupported(message)) if message.contains("SSE/KMS")));
+    assert!(matches!(
+        e.table_key_info(account, "unsupported-encryption").await,
+        Err(StorageError::TableNotFound(_))
+    ));
+    assert!(
+        e.validate_sse_specification(Some(&serde_json::json!({"Enabled":false})))
+            .is_ok()
+    );
     // Exercise the shared account guard under concurrent control-plane writes.
     let jobs = (0..32).map(|i| {
         let e = e.clone();

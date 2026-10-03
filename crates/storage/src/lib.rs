@@ -183,6 +183,15 @@ pub struct StreamCapture {
 /// This enables multi-account isolation: different accounts can have tables
 /// with the same name without conflict.
 pub trait TableEngine: Send + Sync {
+    /// Reject encryption requests a backend cannot honor before table mutation.
+    /// The default preserves existing backends' handling; accepting this hook
+    /// alone does not establish encryption at rest or AWS KMS integration.
+    fn validate_sse_specification(
+        &self,
+        _specification: Option<&serde_json::Value>,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
     fn create_table(
         &self,
         account_id: &str,

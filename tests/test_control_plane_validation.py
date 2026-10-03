@@ -93,3 +93,17 @@ def test_disable_ttl_wrong_attribute_preserves_configuration(dynamodb_client, ta
     ttl = client.describe_time_to_live(TableName=name)["TimeToLiveDescription"]
     assert ttl["AttributeName"] == "expiry"
     assert ttl["TimeToLiveStatus"] in ("ENABLED", "ENABLING")
+
+
+@pytest.mark.parametrize("spec", [{"Enabled": True}, {"AttributeName": "expiry"}])
+def test_ttl_required_members_are_client_errors(dynamodb_client_no_validation, table, spec):
+    with pytest.raises(ClientError, match="ValidationException"):
+        dynamodb_client_no_validation.update_time_to_live(TableName=table["TableName"], TimeToLiveSpecification=spec)
+    assert dynamodb_client_no_validation.describe_time_to_live(TableName=table["TableName"])["TimeToLiveDescription"]["TimeToLiveStatus"] == "DISABLED"
+
+
+def test_describe_endpoints_returns_the_connected_authority(dynamodb_client):
+    from urllib.parse import urlsplit
+    endpoint = dynamodb_client.describe_endpoints()["Endpoints"][0]
+    assert endpoint["Address"] == urlsplit(dynamodb_client.meta.endpoint_url).netloc
+    assert endpoint["CachePeriodInMinutes"] > 0
