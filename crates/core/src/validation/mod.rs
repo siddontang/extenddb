@@ -1,6 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod streams;
+pub mod tags;
 pub mod vector_item;
 
 pub use vector_item::{
@@ -111,6 +113,9 @@ pub fn validate_create_table(
     validate_index_projections(input)?;
     validate_vector_indexes(input)?;
     validate_stream_specification(input)?;
+    if let Some(tags) = &input.tags {
+        tags::validate_tags(tags)?;
+    }
     Ok(())
 }
 

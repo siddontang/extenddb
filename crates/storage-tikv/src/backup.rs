@@ -488,40 +488,73 @@ mod tests {
             Arc::new(MemoryStore::default()),
             "backup_legacy",
             "us-east-1",
-        ).unwrap();
+        )
+        .unwrap();
         let account = "111111111111";
-        TikvCatalog::new(engine.clone()).create_account(account, "owner").await.unwrap();
-        engine.create_table(account, serde_json::from_value(serde_json::json!({
-            "TableName":"source", "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
-            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
-            "BillingMode":"PAY_PER_REQUEST"
-        })).unwrap()).await.unwrap();
-        let details = engine.create_backup(account, "source", "old-format").await.unwrap();
-        let item: Item = serde_json::from_value(serde_json::json!({"pk":{"S":"original"}})).unwrap();
-        engine.db.run(|tx| {
-            let engine = engine.clone();
-            let arn = details.backup_arn.clone();
-            let item = item.clone();
-            Box::pin(async move {
-                let backup = engine.backup(tx, account, &arn).await?;
-                let mut old = serde_json::to_value(backup).unwrap();
-                old.as_object_mut().unwrap().remove("chunks");
-                old.as_object_mut().unwrap().remove("item_count");
-                old["items"] = serde_json::json!([item]);
-                kv::put(tx, engine.key(&["backup", account, &arn]), &old).await
+        TikvCatalog::new(engine.clone())
+            .create_account(account, "owner")
+            .await
+            .unwrap();
+        engine
+            .create_table(
+                account,
+                serde_json::from_value(serde_json::json!({
+                    "TableName":"source", "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                    "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                    "BillingMode":"PAY_PER_REQUEST"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let details = engine
+            .create_backup(account, "source", "old-format")
+            .await
+            .unwrap();
+        let item: Item =
+            serde_json::from_value(serde_json::json!({"pk":{"S":"original"}})).unwrap();
+        engine
+            .db
+            .run(|tx| {
+                let engine = engine.clone();
+                let arn = details.backup_arn.clone();
+                let item = item.clone();
+                Box::pin(async move {
+                    let backup = engine.backup(tx, account, &arn).await?;
+                    let mut old = serde_json::to_value(backup).unwrap();
+                    old.as_object_mut().unwrap().remove("chunks");
+                    old.as_object_mut().unwrap().remove("item_count");
+                    old["items"] = serde_json::json!([item]);
+                    kv::put(tx, engine.key(&["backup", account, &arn]), &old).await
+                })
             })
-        }).await.unwrap();
-        assert_eq!(engine.describe_backup(account, &details.backup_arn).await.unwrap()
-            .source_table_details.item_count, 1);
-        engine.restore_table_from_backup(account, "restored", &details.backup_arn).await.unwrap();
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .describe_backup(account, &details.backup_arn)
+                .await
+                .unwrap()
+                .source_table_details
+                .item_count,
+            1
+        );
+        engine
+            .restore_table_from_backup(account, "restored", &details.backup_arn)
+            .await
+            .unwrap();
         // Restore publication includes every row, even while the table is CREATING.
-        let rows = engine.db.run(|tx| {
-            let engine = engine.clone();
-            Box::pin(async move {
-                let table = engine.table_by_name(tx, account, "restored").await?;
-                kv::all(tx, engine.item_prefix(&table.description.table_id)).await
+        let rows = engine
+            .db
+            .run(|tx| {
+                let engine = engine.clone();
+                Box::pin(async move {
+                    let table = engine.table_by_name(tx, account, "restored").await?;
+                    kv::all(tx, engine.item_prefix(&table.description.table_id)).await
+                })
             })
-        }).await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(kv::decode::<Item>(&rows[0].1).unwrap(), item);
     }

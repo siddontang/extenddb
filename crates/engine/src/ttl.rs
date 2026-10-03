@@ -84,6 +84,15 @@ pub async fn handle_update_time_to_live(
         ));
     }
 
+    if !input.time_to_live_specification.enabled
+        && current.attribute_name.as_deref()
+            != Some(&input.time_to_live_specification.attribute_name)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "TimeToLive is active on a different AttributeName".to_owned(),
+        ));
+    }
+
     // Resolve the old attribute before committing the disable. If the catalog
     // is inconsistent, fail without leaving a partially applied request.
     let ttl_attribute_to_drop = if !input.time_to_live_specification.enabled {
@@ -152,7 +161,8 @@ pub async fn handle_update_time_to_live(
 fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
     if name.is_empty() || name.len() > 255 {
         return Err(DynamoDbError::ValidationException(
-            "TimeToLiveSpecification.AttributeName must be between 1 and 255 characters".to_owned(),
+            "TimeToLiveSpecification.AttributeName length must be between 1 and 255 characters"
+                .to_owned(),
         ));
     }
     if !name
@@ -168,6 +178,7 @@ fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
 
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
+        StorageError::Validation(message) => DynamoDbError::ValidationException(message),
         StorageError::TableNotFound(_name) => {
             DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
         }

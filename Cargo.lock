@@ -1291,6 +1291,7 @@ version = "0.1.13"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

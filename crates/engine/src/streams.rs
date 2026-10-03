@@ -9,6 +9,9 @@ use extenddb_core::types::{
     GetShardIteratorInput, GetShardIteratorOutput, ListStreamsInput, ListStreamsOutput,
     ShardIteratorType,
 };
+use extenddb_core::validation::streams::{
+    sequence_position, validate_iterator_sequence, validate_stream_arn, validate_stream_limit,
+};
 use extenddb_storage::error::StorageError;
 use serde_json::Value;
 
@@ -27,6 +30,9 @@ pub async fn handle_describe_stream(
 ) -> Result<Value, DynamoDbError> {
     let input: DescribeStreamInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+
+    validate_stream_arn(&input.stream_arn)?;
+    validate_stream_limit(input.limit, 100)?;
 
     let desc = ctx
         .storage
@@ -52,7 +58,11 @@ pub async fn handle_list_streams(
     let input: ListStreamsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
 
-    let limit = input.limit.unwrap_or(100).min(100);
+    validate_stream_limit(input.limit, 100)?;
+    if let Some(arn) = &input.exclusive_start_stream_arn {
+        validate_stream_arn(arn)?;
+    }
+    let limit = input.limit.unwrap_or(100);
     let (streams, last_arn) = ctx
         .storage
         .list_streams(
@@ -83,8 +93,24 @@ pub async fn handle_get_shard_iterator(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "ShardIteratorType",
+            valid: &[
+                "TRIM_HORIZON",
+                "LATEST",
+                "AT_SEQUENCE_NUMBER",
+                "AFTER_SEQUENCE_NUMBER",
+            ],
+            clause: crate::EnumClause::Named("shardIteratorType"),
+        }],
+    )?;
     let input: GetShardIteratorInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+
+    validate_stream_arn(&input.stream_arn)?;
+    validate_iterator_sequence(input.shard_iterator_type, input.sequence_number.as_deref())?;
 
     // Validate the stream and shard exist before issuing an iterator.
     ctx.storage
@@ -103,34 +129,18 @@ pub async fn handle_get_shard_iterator(
                 .map_err(storage_to_dynamo)?
                 .unwrap_or_default()
         }
-        ShardIteratorType::AtSequenceNumber => {
-            // Convert to AFTER_SEQUENCE_NUMBER by subtracting 1, so the
-            // exclusive "after" semantics produce inclusive "at" behavior.
-            let raw = input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AT_SEQUENCE_NUMBER iterator type".to_owned(),
-                )
-            })?;
-            let n = raw.parse::<u128>().map_err(|_| {
-                DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned())
-            })?;
-            // n == 0: sequence 0 is the first possible record, so "at 0"
-            // means "read from the beginning" — same as TRIM_HORIZON.
-            if n > 0 {
-                // Pad to the backend's stored width so lexicographic order
-                // matches numeric order against stored sequence numbers.
-                let width = ctx.storage.sequence_number_width();
-                format!("{:0>width$}", n - 1)
-            } else {
-                String::new()
-            }
-        }
-        ShardIteratorType::AfterSequenceNumber => {
-            input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AFTER_SEQUENCE_NUMBER iterator type".to_owned(),
-                )
-            })?
+        ShardIteratorType::AtSequenceNumber | ShardIteratorType::AfterSequenceNumber => {
+            sequence_position(
+                input
+                    .sequence_number
+                    .as_deref()
+                    .expect("validated sequence"),
+                ctx.storage.sequence_number_width(),
+                matches!(
+                    input.shard_iterator_type,
+                    ShardIteratorType::AtSequenceNumber
+                ),
+            )
         }
     };
 
@@ -176,6 +186,8 @@ pub async fn handle_get_records(
     let input: GetRecordsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
 
+    validate_stream_limit(input.limit, 1000)?;
+
     let token = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &input.shard_iterator,
@@ -217,7 +229,7 @@ pub async fn handle_get_records(
         }
     }
 
-    let limit = input.limit.unwrap_or(1000).min(1000);
+    let limit = input.limit.unwrap_or(1000);
 
     // All iterator types are now resolved to AFTER_SEQUENCE_NUMBER at
     // GetShardIterator time. Empty seq means "read from beginning".
@@ -262,35 +274,6 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
-    /// the backend's stored width. Verify that an unpadded client input is
-    /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)
-    /// and 23-digit (cassandra) cases, and that the edge case n=0 maps to
-    /// TRIM_HORIZON (empty string).
-    #[test]
-    fn at_sequence_number_padding() {
-        let cases: &[(&str, usize, &str)] = &[
-            ("5", 21, "000000000000000000004"),
-            ("000000000000000000005", 21, "000000000000000000004"),
-            ("5", 23, "00000000000000000000004"),
-            ("00000000000000000000005", 23, "00000000000000000000004"),
-            ("0", 21, ""),
-            ("1", 21, "000000000000000000000"),
-        ];
-        for (input, width, expected) in cases {
-            let n: u128 = input.parse().unwrap();
-            let result = if n > 0 {
-                format!("{:0>width$}", n - 1)
-            } else {
-                String::new()
-            };
-            assert_eq!(&result, expected, "input={input} width={width}");
         }
     }
 }

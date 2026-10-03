@@ -110,6 +110,8 @@ impl MetadataEngine for TikvEngine {
                         stored.push(t);
                     }
                     stored.sort_by(|a, b| a.key.cmp(&b.key));
+                    extenddb_core::validation::tags::validate_tags(&stored)
+                        .map_err(|error| StorageError::Validation(error.to_string()))?;
                     kv::put(tx, k, &stored).await
                 })
             })

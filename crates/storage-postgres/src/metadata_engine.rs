@@ -94,6 +94,17 @@ impl MetadataEngine for PostgresEngine {
         let arn = arn.to_string();
         let tags = tags.to_vec();
         Box::pin(async move {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Serialize additions for one ARN, including the empty-tag case.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&arn)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             for tag in &tags {
                 sqlx::query(
                     "INSERT INTO tags (resource_arn, tag_key, tag_value) VALUES ($1, $2, $3) \
@@ -102,10 +113,25 @@ impl MetadataEngine for PostgresEngine {
                 .bind(&arn)
                 .bind(&tag.key)
                 .bind(&tag.value)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT tag_key, tag_value FROM tags WHERE resource_arn = $1")
+                    .bind(&arn)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let merged: Vec<Tag> = rows
+                .into_iter()
+                .map(|(key, value)| Tag { key, value })
+                .collect();
+            extenddb_core::validation::tags::validate_tags(&merged)
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             Ok(())
         })
     }
