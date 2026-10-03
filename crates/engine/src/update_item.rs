@@ -225,6 +225,7 @@ pub async fn handle_update_item(
     }
 
     // Validate that no update action targets a key attribute (REQ-DATA-003)
+    extenddb_core::expression::validate_update_paths(&actions, &maps)?;
     validate_no_key_updates(&actions, &key_info, &maps)?;
 
     let return_old = matches!(

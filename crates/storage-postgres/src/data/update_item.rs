@@ -173,6 +173,10 @@ impl PostgresEngine {
                 Err(e) => return Err(e),
             }
 
+            if old_json.is_none() && !expression::update_creates_item(actions) {
+                return Ok((None, None));
+            }
+
             // Apply update actions and validate the resulting image against the
             // table's vector indexes: vector validity is a property of the stored
             // value, and expression-form checks cannot cover if_not_exists /

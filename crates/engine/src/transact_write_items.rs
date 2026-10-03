@@ -484,6 +484,7 @@ async fn prepare_write_op(
         );
         let actions =
             crate::expression_helpers::parse_update_expr(&upd.update_expression, &ctx.limits)?;
+        extenddb_core::expression::validate_update_paths(&actions, &maps)?;
         validate_no_key_updates(&actions, &key_info, &maps)?;
 
         // Validate nesting depth of EAV values that get stored via SET actions.

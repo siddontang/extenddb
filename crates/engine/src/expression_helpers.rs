@@ -122,7 +122,7 @@ pub fn parse_update_expr(
 
 /// Parse an optional condition expression string into an AST.
 ///
-/// Returns `None` if the input is `None` or empty.
+/// Returns `None` only when the parameter is absent. An empty expression is invalid.
 ///
 /// # Errors
 ///
@@ -132,7 +132,10 @@ pub fn parse_optional_condition(
     limits: &LimitsConfig,
 ) -> Result<Option<Expr>, DynamoDbError> {
     match expr {
-        Some(s) if !s.is_empty() => parse_condition_expr(s, limits).map(Some),
+        Some("") => Err(DynamoDbError::ValidationException(
+            "Invalid ConditionExpression: The expression can not be empty;".into(),
+        )),
+        Some(s) => parse_condition_expr(s, limits).map(Some),
         _ => Ok(None),
     }
 }
@@ -140,7 +143,7 @@ pub fn parse_optional_condition(
 /// Parse an optional filter expression string into an AST.
 ///
 /// `FilterExpression` uses the same grammar as `ConditionExpression`.
-/// Returns `None` if the input is `None` or empty.
+/// Returns `None` only when the parameter is absent. An empty expression is invalid.
 ///
 /// # Errors
 ///

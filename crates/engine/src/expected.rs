@@ -65,8 +65,20 @@ fn desugar_one(
     values: &mut HashMap<String, AttributeValue>,
     counter: &mut u32,
 ) -> Result<Expr, DynamoDbError> {
+    if (expected.value.is_some() || expected.exists.is_some())
+        && expected.attribute_value_list.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Value and Exists cannot be combined with AttributeValueList".into(),
+        ));
+    }
     // Case 1: Exists = true/false
     if let Some(exists) = expected.exists {
+        if exists && expected.value.is_none() {
+            return Err(DynamoDbError::ValidationException(
+                "Value is required when Exists is true".into(),
+            ));
+        }
         if expected.comparison_operator.is_some() {
             return Err(DynamoDbError::ValidationException(
                 "One or more parameter values were invalid: Exists and ComparisonOperator cannot be used together"
@@ -141,6 +153,7 @@ fn desugar_one(
         },
     };
 
+    extenddb_core::validation::legacy::validate_legacy_comparison(op_str, vals)?;
     match op_str {
         "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
             if vals.len() != 1 {

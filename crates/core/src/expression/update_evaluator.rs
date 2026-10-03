@@ -32,16 +32,20 @@ pub(crate) fn apply_update(
     // then applies the results. This means `SET a = :v, b = a` assigns `b`
     // the *original* value of `a`, not the value just written by the first clause.
     let snapshot = item.clone();
-    for action in actions {
-        if let UpdateAction::Set { path, value } = action {
-            let resolved_value = evaluate_set_value(value, &snapshot, maps)?;
-            set_path(item, path, resolved_value, maps)?;
-        }
-    }
-    for action in actions {
-        if let UpdateAction::Remove { path } = action {
-            remove_path(item, path, maps)?;
-        }
+    let mut sets: Vec<_> = actions
+        .iter()
+        .filter_map(|a| {
+            if let UpdateAction::Set { path, value } = a {
+                Some((path, value))
+            } else {
+                None
+            }
+        })
+        .collect();
+    sets.sort_by(|(a, _), (b, _)| compare_paths(a, b, maps));
+    for (path, value) in sets {
+        let resolved_value = evaluate_set_value(value, &snapshot, maps)?;
+        set_path(item, path, resolved_value, maps)?;
     }
     for action in actions {
         if let UpdateAction::Add { path, value } = action {
@@ -55,7 +59,63 @@ pub(crate) fn apply_update(
             apply_delete(item, path, &resolved_value, maps)?;
         }
     }
+    let mut removes: Vec<_> = actions
+        .iter()
+        .filter_map(|a| {
+            if let UpdateAction::Remove { path } = a {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    removes.sort_by(|a, b| compare_paths(b, a, maps));
+    for path in removes {
+        remove_path(item, path, maps)?;
+    }
     Ok(())
+}
+
+/// Whether an update may create an absent item. A nonempty deletion-only
+/// update is a no-op after its condition has been evaluated by storage.
+pub fn update_creates_item(actions: &[UpdateAction]) -> bool {
+    actions.is_empty()
+        || actions
+            .iter()
+            .any(|a| matches!(a, UpdateAction::Set { .. } | UpdateAction::Add { .. }))
+}
+
+fn compare_paths(
+    a: &[PathElement],
+    b: &[PathElement],
+    maps: &ExpressionMaps,
+) -> std::cmp::Ordering {
+    for (a, b) in a.iter().zip(b) {
+        let order = match (a, b) {
+            (PathElement::Index(a), PathElement::Index(b)) => a.cmp(b),
+            (PathElement::Attribute(a), PathElement::Attribute(b)) => {
+                let resolve = |s: &String| {
+                    s.strip_prefix('#')
+                        .and_then(|r| maps.names.get(r))
+                        .unwrap_or(s)
+                        .clone()
+                };
+                resolve(a).cmp(&resolve(b))
+            }
+            (PathElement::Attribute(_), PathElement::Index(_)) => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Greater,
+        };
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn invalid_update_path() -> DynamoDbError {
+    DynamoDbError::ValidationException(
+        "The document path provided in the update expression is invalid for update".into(),
+    )
 }
 
 /// Apply a list of update actions and validate the resulting item image
@@ -248,13 +308,7 @@ fn apply_add(
     value: AttributeValue,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    let target = navigate_to_parent_map_or_create(item, path, maps)?;
-    let attr_name = resolve_attr_name(
-        path.last()
-            .ok_or_else(|| DynamoDbError::ValidationException("Empty path in ADD".to_owned()))?,
-        maps,
-    )?;
-    let existing = target.get(&attr_name);
+    let existing = resolve_path_to_value(path, item, maps)?.cloned();
 
     let new_value = match (&existing, &value) {
         // Number or set: set if missing
@@ -306,8 +360,7 @@ fn apply_add(
         }
     };
 
-    target.insert(attr_name, new_value);
-    Ok(())
+    set_path(item, path, new_value, maps)
 }
 
 /// Apply a DELETE action to an item.
@@ -321,40 +374,37 @@ fn apply_delete(
     value: &AttributeValue,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    let Some(target) = navigate_to_parent_map(item, path, maps)? else {
-        return Ok(()); // Parent path doesn't exist — no-op
-    };
-    let attr_name = resolve_attr_name(
-        path.last()
-            .ok_or_else(|| DynamoDbError::ValidationException("Empty path in DELETE".to_owned()))?,
-        maps,
-    )?;
-    let Some(existing) = target.get(&attr_name) else {
-        return Ok(()); // No-op if attribute doesn't exist
+    if !matches!(
+        value,
+        AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+    ) {
+        return Err(DynamoDbError::ValidationException(
+            "An operand in the update expression has an incorrect data type".into(),
+        ));
+    }
+    let Some(existing) = resolve_path_to_value(path, item, maps)?.cloned() else {
+        return Ok(());
     };
 
-    let new_value = match (existing, value) {
+    let new_value = match (&existing, value) {
         (AttributeValue::SS(existing_set), AttributeValue::SS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
-                return Ok(());
+                return remove_path(item, path, maps);
             }
             AttributeValue::SS(remaining)
         }
         (AttributeValue::NS(existing_set), AttributeValue::NS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
-                return Ok(());
+                return remove_path(item, path, maps);
             }
             AttributeValue::NS(remaining)
         }
         (AttributeValue::BS(existing_set), AttributeValue::BS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
-                return Ok(());
+                return remove_path(item, path, maps);
             }
             AttributeValue::BS(remaining)
         }
@@ -365,116 +415,9 @@ fn apply_delete(
         }
     };
 
-    target.insert(attr_name, new_value);
-    Ok(())
+    set_path(item, path, new_value, maps)
 }
 
-/// Navigate a document path to the parent map of the leaf element, creating
-/// intermediate maps as needed. Used by ADD which must create the path if absent.
-///
-/// For a single-element path, returns the item itself.
-fn navigate_to_parent_map_or_create<'a>(
-    item: &'a mut BTreeMap<String, AttributeValue>,
-    path: &[PathElement],
-    maps: &ExpressionMaps,
-) -> Result<&'a mut BTreeMap<String, AttributeValue>, DynamoDbError> {
-    if path.len() <= 1 {
-        return Ok(item);
-    }
-    let first_name = resolve_attr_name(&path[0], maps)?;
-    let mut current = item
-        .entry(first_name)
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-    for element in &path[1..path.len() - 1] {
-        match element {
-            PathElement::Attribute(_) => {
-                let name = resolve_attr_name(element, maps)?;
-                if let AttributeValue::M(map) = current {
-                    current = map
-                        .entry(name)
-                        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-                } else {
-                    return Err(DynamoDbError::ValidationException(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_owned(),
-                    ));
-                }
-            }
-            PathElement::Index(idx) => {
-                if let AttributeValue::L(list) = current {
-                    if *idx < list.len() {
-                        current = &mut list[*idx];
-                    } else {
-                        return Err(DynamoDbError::ValidationException(
-                            "The provided expression refers to an attribute that does not exist in the item"
-                                .to_owned(),
-                        ));
-                    }
-                } else {
-                    return Err(DynamoDbError::ValidationException(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
-    }
-    match current {
-        AttributeValue::M(map) => Ok(map),
-        _ => Err(DynamoDbError::ValidationException(
-            "The document path provided in the update expression is invalid for update".to_owned(),
-        )),
-    }
-}
-
-/// Navigate a document path to the parent map of the leaf element without
-/// creating intermediate maps. Returns `None` if the path doesn't exist.
-/// Used by DELETE which is a no-op when the path is absent.
-fn navigate_to_parent_map<'a>(
-    item: &'a mut BTreeMap<String, AttributeValue>,
-    path: &[PathElement],
-    maps: &ExpressionMaps,
-) -> Result<Option<&'a mut BTreeMap<String, AttributeValue>>, DynamoDbError> {
-    if path.len() <= 1 {
-        return Ok(Some(item));
-    }
-    let first_name = resolve_attr_name(&path[0], maps)?;
-    let Some(mut current) = item.get_mut(&first_name) else {
-        return Ok(None);
-    };
-    for element in &path[1..path.len() - 1] {
-        match element {
-            PathElement::Attribute(_) => {
-                let name = resolve_attr_name(element, maps)?;
-                if let AttributeValue::M(map) = current {
-                    let Some(next) = map.get_mut(&name) else {
-                        return Ok(None);
-                    };
-                    current = next;
-                } else {
-                    return Ok(None);
-                }
-            }
-            PathElement::Index(idx) => {
-                if let AttributeValue::L(list) = current {
-                    if *idx < list.len() {
-                        current = &mut list[*idx];
-                    } else {
-                        return Ok(None);
-                    }
-                } else {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-    match current {
-        AttributeValue::M(map) => Ok(Some(map)),
-        _ => Ok(None),
-    }
-}
-
-/// Set a value at a document path, creating intermediate maps as needed.
 fn set_path(
     item: &mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
@@ -578,7 +521,7 @@ fn remove_path(
     }
 
     let Some(current) = item.get_mut(&first_name) else {
-        return Ok(()); // Path doesn't exist — REMOVE is a no-op
+        return Err(invalid_update_path());
     };
 
     remove_nested(current, &path[1..], maps)
@@ -595,10 +538,12 @@ fn remove_nested(
                 let name = resolve_attr_name(&path[0], maps)?;
                 map.remove(&name);
             }
-            (PathElement::Index(idx), AttributeValue::L(list)) if *idx < list.len() => {
-                list.remove(*idx);
+            (PathElement::Index(idx), AttributeValue::L(list)) => {
+                if *idx < list.len() {
+                    list.remove(*idx);
+                }
             }
-            _ => {} // No-op for type mismatch
+            _ => return Err(invalid_update_path()),
         }
         return Ok(());
     }
@@ -606,14 +551,13 @@ fn remove_nested(
     match (&path[0], current) {
         (PathElement::Attribute(_), AttributeValue::M(map)) => {
             let name = resolve_attr_name(&path[0], maps)?;
-            if let Some(next) = map.get_mut(&name) {
-                remove_nested(next, &path[1..], maps)?;
-            }
+            let next = map.get_mut(&name).ok_or_else(invalid_update_path)?;
+            remove_nested(next, &path[1..], maps)?;
         }
         (PathElement::Index(idx), AttributeValue::L(list)) if *idx < list.len() => {
             remove_nested(&mut list[*idx], &path[1..], maps)?;
         }
-        _ => {} // No-op
+        _ => return Err(invalid_update_path()),
     }
     Ok(())
 }

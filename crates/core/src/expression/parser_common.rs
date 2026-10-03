@@ -15,7 +15,9 @@ pub fn parse_path(tokens: &[Token], pos: &mut usize) -> Result<Vec<PathElement>,
     let mut elements = Vec::new();
 
     match &tokens.get(*pos) {
-        Some(Token::Ident(name)) => {
+        Some(Token::Ident(name))
+            if name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) =>
+        {
             elements.push(PathElement::Attribute(name.clone()));
             *pos += 1;
         }
@@ -32,7 +34,9 @@ pub fn parse_path(tokens: &[Token], pos: &mut usize) -> Result<Vec<PathElement>,
         if tokens[*pos] == Token::Dot {
             *pos += 1;
             match &tokens.get(*pos) {
-                Some(Token::Ident(name)) => {
+                Some(Token::Ident(name))
+                    if name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) =>
+                {
                     elements.push(PathElement::Attribute(name.clone()));
                     *pos += 1;
                 }
@@ -47,13 +51,15 @@ pub fn parse_path(tokens: &[Token], pos: &mut usize) -> Result<Vec<PathElement>,
         } else if tokens[*pos] == Token::LBracket {
             *pos += 1;
             if let Some(Token::Ident(idx_str)) = tokens.get(*pos) {
-                let idx: usize = idx_str
-                    .parse()
-                    .map_err(|_| validation_err("expected numeric index in brackets"))?;
+                let idx: usize = idx_str.parse().map_err(|_| {
+                    validation_err("Syntax error: expected numeric index in brackets")
+                })?;
                 elements.push(PathElement::Index(idx));
                 *pos += 1;
             } else {
-                return Err(validation_err("expected numeric index in brackets"));
+                return Err(validation_err(
+                    "Syntax error: expected numeric index in brackets",
+                ));
             }
             expect_token(tokens, pos, &Token::RBracket, "]", "expression")?;
         } else {
@@ -61,6 +67,11 @@ pub fn parse_path(tokens: &[Token], pos: &mut usize) -> Result<Vec<PathElement>,
         }
     }
 
+    if elements.len() > 32 {
+        return Err(validation_err(
+            "The document path has too many nesting levels",
+        ));
+    }
     Ok(elements)
 }
 

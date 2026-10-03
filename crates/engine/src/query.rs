@@ -318,6 +318,13 @@ pub async fn handle_query(
         }
     }
 
+    extenddb_core::validation::query::validate_query_keys(
+        &key_condition,
+        effective_maps,
+        &query_key_info.key_schema,
+        &query_key_info.attribute_definitions,
+    )?;
+
     // Parse FilterExpression or desugar legacy QueryFilter
     let (filter, filter_maps) = if let Some(ref qf) = input.query_filter {
         if qf.is_empty() {
@@ -464,6 +471,11 @@ pub async fn handle_query(
 
     // Validate begins_with operand types upfront (before any rows are read).
     if let Some(ref f) = filter {
+        extenddb_core::validation::query::validate_query_filter(
+            f,
+            &combined_maps,
+            &query_key_info.key_schema,
+        )?;
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;

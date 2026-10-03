@@ -134,14 +134,12 @@ fn parse_primary(
     }
 
     // Try function call: ident followed by '('
-    if let Token::Ident(name) = &tokens[*pos] {
-        let fn_name_lower = name.to_ascii_lowercase();
-        if is_function_name(&fn_name_lower)
-            && *pos + 1 < tokens.len()
-            && tokens[*pos + 1] == Token::LParen
-        {
-            return parse_function_call(tokens, pos, depth, max_depth);
-        }
+    if let Token::Ident(name) = &tokens[*pos]
+        && name != "size"
+        && *pos + 1 < tokens.len()
+        && tokens[*pos + 1] == Token::LParen
+    {
+        return parse_function_call(tokens, pos, depth, max_depth);
     }
 
     // Operand — then check for comparator, BETWEEN, or IN
@@ -214,10 +212,7 @@ fn parse_operand(
         }
         Token::Ident(name) => {
             // size(path) is a function that returns a value, usable as an operand
-            if name.eq_ignore_ascii_case("size")
-                && *pos + 1 < tokens.len()
-                && tokens[*pos + 1] == Token::LParen
-            {
+            if name == "size" && *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
                 return parse_function_call(tokens, pos, depth, max_depth);
             }
             let elements = parser_common::parse_path(tokens, pos)?;
@@ -246,13 +241,18 @@ fn parse_function_call(
     }
     *depth += 1;
     let name = match &tokens[*pos] {
-        Token::Ident(n) => n.to_ascii_lowercase(),
+        Token::Ident(n) => n.clone(),
         _ => {
             return Err(validation_err(
                 "Invalid ConditionExpression: expected function name",
             ));
         }
     };
+    if !is_function_name(&name) && name != "size" {
+        return Err(validation_err(&format!(
+            "Invalid ConditionExpression: Function {name} is not allowed"
+        )));
+    }
     *pos += 1;
 
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;

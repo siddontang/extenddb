@@ -73,6 +73,11 @@ impl Projection {
         let resolved = resolve_paths(paths, maps).map_err(prefix_projection_error)?;
         if reject_overlap {
             check_overlap(&resolved)?;
+            super::validation::validate_document_paths(
+                &paths.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                maps,
+                "ProjectionExpression",
+            )?;
         }
         Ok(Self {
             root: build_trie(resolved),

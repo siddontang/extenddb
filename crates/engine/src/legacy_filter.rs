@@ -214,6 +214,10 @@ fn desugar_one_filter_condition(
     values: &mut HashMap<String, AttributeValue>,
     counter: &mut u32,
 ) -> Result<Expr, DynamoDbError> {
+    extenddb_core::validation::legacy::validate_legacy_comparison(
+        &cond.comparison_operator,
+        &cond.attribute_value_list,
+    )?;
     match cond.comparison_operator.as_str() {
         "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
             if cond.attribute_value_list.len() != 1 {

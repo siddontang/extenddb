@@ -129,6 +129,9 @@ impl TikvEngine {
             Change::Delete => None,
             Change::Put => Some(op.item.clone()),
             Change::Update(actions) => {
+                if old.is_none() && !expression::update_creates_item(actions) {
+                    return Ok((None, None));
+                }
                 let mut item = old.clone().unwrap_or_else(|| op.item.clone());
                 expression::apply_update_validated(
                     actions,

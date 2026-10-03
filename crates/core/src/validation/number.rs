@@ -4,8 +4,8 @@
 use crate::error::DynamoDbError;
 
 const MAX_SIGNIFICANT_DIGITS: usize = 38;
-const MAX_EXPONENT: i32 = 125;
-const MIN_EXPONENT: i32 = -130;
+const MAX_EXPONENT: i64 = 125;
+const MIN_EXPONENT: i64 = -130;
 
 /// Validate and normalize a `DynamoDB` number string.
 pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
@@ -54,7 +54,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // The value is: <int_part>.<frac_part> * 10^explicit_exp
     // Which equals: <all_digits> * 10^(explicit_exp - frac_part.len())
     let all_digits = format!("{int_part}{frac_part}");
-    let point_offset = explicit_exp - frac_part.len() as i32;
+    let point_offset = i64::from(explicit_exp) - frac_part.len() as i64;
 
     // Strip leading zeros to get significant digits
     let sig_start = all_digits
@@ -83,11 +83,11 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     //       = significant_as_integer * 10^point_offset  (leading zeros don't change value)
     //       = sig_trimmed_as_integer * 10^(point_offset + trailing_zeros)
     let trailing_zeros = significant.len() - sig_end;
-    let exp = point_offset + trailing_zeros as i32;
+    let exp = point_offset + trailing_zeros as i64;
 
     // Magnitude: the number is sig_trimmed * 10^exp, so its order of magnitude
     // is sig_trimmed.len() - 1 + exp
-    let magnitude_exp = sig_trimmed.len() as i32 - 1 + point_offset + trailing_zeros as i32;
+    let magnitude_exp = sig_trimmed.len() as i64 - 1 + point_offset + trailing_zeros as i64;
 
     if magnitude_exp > MAX_EXPONENT {
         return Err(overflow_err());
@@ -98,7 +98,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
 
     // Format the normalized number
     // sig_trimmed represents an integer, and we multiply by 10^exp
-    let result = format_plain(negative, sig_trimmed, exp);
+    let result = format_plain(negative, sig_trimmed, exp as i32);
 
     // Handle -0 case
     if negative && result == "-0" {

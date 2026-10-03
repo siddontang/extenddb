@@ -1,6 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
+pub mod legacy;
 pub mod number;
+pub mod query;
 pub mod streams;
 pub mod tags;
 pub mod vector_item;
@@ -758,6 +760,11 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
                         "One or more parameter values were invalid: Index KeySchema: The second KeySchemaElement is not a RANGE type".to_owned(),
                     ));
                 }
+                if range.attribute_name == hash.attribute_name {
+                    return Err(DynamoDbError::ValidationException(
+                        "Local secondary index hash key and range key must be different".into(),
+                    ));
+                }
             }
             [] | [_] => {
                 return Err(DynamoDbError::ValidationException(format!(
@@ -777,6 +784,15 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
 }
 
 fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    let mut unique = std::collections::HashSet::new();
+    for definition in &input.attribute_definitions {
+        if !unique.insert(&definition.attribute_name) {
+            return Err(DynamoDbError::ValidationException(format!(
+                "Duplicate AttributeName in AttributeDefinitions: {}",
+                definition.attribute_name
+            )));
+        }
+    }
     // A vector attribute must NOT be declared in AttributeDefinitions, and this is
     // checked before anything else here because the attribute may simultaneously be
     // a legitimate key attribute: without this, naming the table's own partition key
@@ -1312,6 +1328,10 @@ fn validate_key_attribute_type(
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Type mismatch for key {attr_name} expected: {type_char} actual: {actual_tag}"
         )));
+    }
+
+    if let AttributeValue::N(number) = value {
+        number::validate_and_normalize_number(number)?;
     }
 
     Ok(())

@@ -62,6 +62,10 @@ impl SqliteEngine {
             }
         }
 
+        if old.is_none() && !expression::update_creates_item(actions) {
+            return Ok((None, None));
+        }
+
         // Start from the existing image, or from the key for a fresh upsert.
         let mut item = old.clone().unwrap_or_else(|| key.clone());
         expression::apply_update_validated(
