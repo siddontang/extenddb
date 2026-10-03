@@ -88,7 +88,8 @@ bounded network pages into memory; they are not an unlimited-size backup API.
 | `catalog::credentials` | Snapshot credential resolution and expiry; deletion/revocation and temporary credential contracts |
 | `catalog::authorization` | User/group/role policies, boundaries, tags and live session data; cross-account and expired-session tests |
 | `catalog::operational` | Settings, bcrypt administrators, aggregated metrics and login failures; password, retention, filtering and isolation tests |
-| `ttl` / `metadata` | Numeric TTL generation, resource tags and statistics; decimal/ancient TTL, replacement and tag contracts |
+| `ttl` / `metadata` | Numeric TTL generation and resource tags; decimal/ancient TTL, replacement and tag contracts |
+| `statistics` | Read-only snapshots and generation-fenced publication; no scan-plus-write commits, recreation and schema-change tests |
 | `maintenance` | Bounded, resumable lifecycle/backfill/deletion and expiry steps; 130-row multi-batch builds interleaved with mutations |
 | `backup` | Atomic chunked backup/restore with a 90 MiB encoded bound; missing-chunk rollback, legacy snapshots, account-generation scoping, rebuilt indexes and duplicate-target tests |
 | `bootstrap` | Namespace reservation, atomic schema seed, encryption/admin/default-account initialization; repeated bootstrap and scoped destroy tests |

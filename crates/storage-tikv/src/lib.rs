@@ -27,6 +27,7 @@ pub mod kv;
 pub mod maintenance;
 pub mod metadata;
 pub mod query;
+mod statistics;
 pub mod stream;
 pub mod table;
 pub mod ttl;
