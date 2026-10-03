@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
 resolver = "2"
+exclude = ["vendor/tikv-client"]
 members = [
     "crates/core",
     "crates/cache",
@@ -119,3 +120,7 @@ inherits = "release"
 strip = true
 lto = true
 codegen-units = 1
+
+# Audited lock-resolution backport; see vendor/tikv-client/EXTENDDB.md.
+[patch.crates-io]
+tikv-client = { path = "vendor/tikv-client" }
