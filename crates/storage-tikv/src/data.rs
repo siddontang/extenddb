@@ -44,6 +44,27 @@ pub(crate) struct Token {
     pub created_ms: i64,
 }
 
+/// Separates per-operation cancellations from request-wide validation.
+/// In particular an empty secondary key is a top-level validation error even
+/// inside TransactWriteItems; storage/condition errors remain per-operation.
+enum MutationError {
+    Storage(StorageError),
+    Input(String),
+}
+impl From<StorageError> for MutationError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+impl MutationError {
+    fn into_storage(self) -> StorageError {
+        match self {
+            Self::Storage(error) => error,
+            Self::Input(message) => StorageError::Validation(message),
+        }
+    }
+}
+
 impl TikvEngine {
     pub(crate) fn item_prefix(&self, id: &str) -> Vec<u8> {
         self.key(&["data", id, "item"])
@@ -62,10 +83,25 @@ impl TikvEngine {
         tx: &mut dyn kv::Transaction,
         op: &Mutation,
     ) -> Result<(Option<Item>, Option<Item>), StorageError> {
+        self.mutate_inner(tx, op, false)
+            .await
+            .map_err(MutationError::into_storage)
+    }
+    async fn mutate_inner(
+        &self,
+        tx: &mut dyn kv::Transaction,
+        op: &Mutation,
+        transactional: bool,
+    ) -> Result<(Option<Item>, Option<Item>), MutationError> {
         let table = self.live_table(tx, &op.info).await?;
         let info = table.key_info();
         match op.change {
             Change::Put => validation::validate_item_keys(
+                &op.item,
+                &info.key_schema,
+                &info.attribute_definitions,
+            ),
+            _ if transactional => validation::validate_batch_key_only(
                 &op.item,
                 &info.key_schema,
                 &info.attribute_definitions,
@@ -85,7 +121,7 @@ impl TikvEngine {
             if !expression::evaluate_condition(condition, old.as_ref().unwrap_or(&empty), &op.maps)
                 .map_err(|e| StorageError::Validation(e.to_string()))?
             {
-                return Err(StorageError::ConditionFailed(old));
+                return Err(StorageError::ConditionFailed(old).into());
             }
         }
         let new = match &op.change {
@@ -116,8 +152,15 @@ impl TikvEngine {
                     key_schema: &i.schema,
                 })
                 .collect();
-            validation::validate_index_keys(item, &refs, &info.attribute_definitions)
+            validation::validate_index_key_types(item, &refs, &info.attribute_definitions)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
+            let context = if matches!(op.change, Change::Update(_)) {
+                validation::SecondaryIndexEmptyContext::UpdateExpression
+            } else {
+                validation::SecondaryIndexEmptyContext::Item
+            };
+            validation::validate_index_key_not_empty(item, &refs, context)
+                .map_err(|e| MutationError::Input(e.to_string()))?;
             kv::put(tx, key, item).await?;
         } else {
             kv::delete(tx, key).await?;
@@ -464,9 +507,9 @@ impl DataEngine for TikvEngine {
                         let mut reasons = vec![];
                         let mut failed = false;
                         for op in ops {
-                            match e.mutate(tx, &op).await {
+                            match e.mutate_inner(tx, &op, true).await {
                                 Ok(_) => reasons.push(CancellationReason::none()),
-                                Err(StorageError::ConditionFailed(old)) => {
+                                Err(MutationError::Storage(StorageError::ConditionFailed(old))) => {
                                     failed = true;
                                     reasons.push(
                                         CancellationReason::condition_check_failed_with_item(
@@ -479,11 +522,11 @@ impl DataEngine for TikvEngine {
                                         ),
                                     );
                                 }
-                                Err(StorageError::Validation(message)) => {
+                                Err(MutationError::Storage(StorageError::Validation(message))) => {
                                     failed = true;
                                     reasons.push(CancellationReason::validation_error(message));
                                 }
-                                Err(e) => return Err(e),
+                                Err(e) => return Err(e.into_storage()),
                             }
                         }
                         if failed {
