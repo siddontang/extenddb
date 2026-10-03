@@ -88,7 +88,7 @@ bounded network pages into memory; they are not an unlimited-size backup API.
 | `catalog::operational` | Settings, bcrypt administrators, aggregated metrics and login failures; password, retention, filtering and isolation tests |
 | `ttl` / `metadata` | Numeric TTL generation, resource tags and statistics; decimal/ancient TTL, replacement and tag contracts |
 | `maintenance` | Bounded, resumable lifecycle/backfill/deletion and expiry steps; 130-row multi-batch builds interleaved with mutations |
-| `backup` | Atomic small-table backup/restore with explicit 4 MiB bound; oversized snapshot rollback, account-generation scoping, rebuilt indexes and duplicate-target tests |
+| `backup` | Atomic chunked backup/restore with a 90 MiB encoded bound; missing-chunk rollback, legacy snapshots, account-generation scoping, rebuilt indexes and duplicate-target tests |
 | `bootstrap` | Namespace reservation, atomic schema seed, encryption/admin/default-account initialization; repeated bootstrap and scoped destroy tests |
 | `backend` | Factory composition and CLI configuration; override/conflict test and real init/serve/verify workflow |
 | `runtime` | Scheduling and graceful shutdown only; single-step engine methods hold behavior, exercised by lifecycle contracts and CLI tests |
@@ -163,8 +163,12 @@ the reference MVCC store and real TiKV.
 * This is an experimental backend, not a PostgreSQL-to-TiKV migration tool. An
   existing PostgreSQL catalog/data set is not automatically copied or converted.
 * Vector search/indexes and point-in-time recovery are explicitly unsupported.
-  On-demand backup is limited to a 4 MiB encoded snapshot; larger backups fail
-  before publishing data. IAM documents have a separate 4 MiB per-account limit.
+  On-demand backups use a manifest and roughly 1 MiB chunks committed from one
+  snapshot. The encoded snapshot limit is 90 MiB; larger backups fail before
+  publication. Restore commits the table, items and rebuilt indexes together.
+  TiKV transaction-size limits also apply, particularly with index projections;
+  this is not an unbounded backup API. Legacy inline snapshots remain readable.
+  IAM documents have a separate 4 MiB per-account limit.
 * Expanded compatibility testing found unresolved failures, including intermittent
   nested `TxnNotFound` errors during concurrent control-plane writes with
   `tikv-client 0.4.0`. These surface as unknown commit outcomes and are not blindly

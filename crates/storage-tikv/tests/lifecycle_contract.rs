@@ -304,13 +304,15 @@ async fn resumable_backfill_ttl_backup_and_delete() {
 }
 
 #[tokio::test]
-async fn oversized_backup_fails_without_publishing_partial_snapshot() {
+async fn chunked_backup_restores_above_the_old_single_value_limit() {
+    let clock = Arc::new(TestClock(AtomicI64::new(1_000_000)));
     let e = TikvEngine::new(
         Arc::new(MemoryStore::default()),
         "backup_limit",
         "us-east-1",
     )
-    .unwrap();
+    .unwrap()
+    .with_clock(clock.clone());
     let account = "111111111111";
     TikvCatalog::new(e.clone())
         .create_account(account, "backup")
@@ -333,8 +335,29 @@ async fn oversized_backup_fails_without_publishing_partial_snapshot() {
             .await
             .unwrap();
     }
-    assert!(matches!(e.create_backup(account, "large", "too-big").await,
-        Err(StorageError::Validation(message)) if message.contains("4 MiB")));
+    let backup = e.create_backup(account, "large", "chunked").await.unwrap();
+    assert!(backup.backup_size_bytes > 4 * 1024 * 1024);
+    // Mutating the source after the snapshot must not alter its restored data.
+    let changed =
+        serde_json::from_value(serde_json::json!({"pk":{"S":"0"},"payload":{"S":"changed"}}))
+            .unwrap();
+    e.put_item(&info, changed, false, None, &maps, None)
+        .await
+        .unwrap();
+    let restored = e
+        .restore_table_from_backup(account, "restored_large", &backup.backup_arn)
+        .await
+        .unwrap();
+    assert_eq!(restored.table_status, TableStatus::Creating);
+    clock.0.fetch_add(5, Ordering::SeqCst);
+    e.lifecycle_step().await.unwrap();
+    let restored = e.table_key_info(account, "restored_large").await.unwrap();
+    for i in 0..12 {
+        let key = serde_json::from_value(serde_json::json!({"pk":{"S":i.to_string()}})).unwrap();
+        let row = e.get_item(&restored, &key).await.unwrap().unwrap();
+        assert_eq!(row["payload"], AttributeValue::S("x".repeat(380 * 1024)));
+    }
+    e.delete_backup(account, &backup.backup_arn).await.unwrap();
     assert!(e.list_backups(account, None).await.unwrap().is_empty());
     assert_eq!(
         e.scan(&info, Some(100), None, None, None, None)
