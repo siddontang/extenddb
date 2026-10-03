@@ -1,5 +1,9 @@
 # Alternator coverage and TiKV TTL contracts
 
+Subsequent repairs and current remaining failures are recorded in the
+[prioritized repair report](testing-fixes-20261003.md). This page retains its
+original checkpoint results.
+
 This extends [the first TiKV compatibility report](testing-tikv.md) with another
 independent source of DynamoDB scenarios. It does not replace the earlier
 results or establish production readiness. No test in this exercise contacts

@@ -1,5 +1,9 @@
 # Full local test run: 2026-10-03 UTC
 
+Subsequent repairs and current remaining failures are recorded in the
+[prioritized repair report](testing-fixes-20261003.md). This page retains its
+original checkpoint results.
+
 Source tested: `c7f057e` on `codex/tikv-backend`. This run changes no product
 code or assertions. It repeats the complete repository API suites against TiKV,
 executes backend-specific PostgreSQL and SQLite tests, and repeats the pinned

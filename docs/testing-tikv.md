@@ -1,5 +1,9 @@
 # Expanded DynamoDB compatibility testing
 
+Subsequent repairs and current remaining failures are recorded in the
+[prioritized repair report](testing-fixes-20261003.md). This page retains its
+original checkpoint results.
+
 Measured on 2026-10-02 UTC against the TiKV branch based on `04212f6`, with the
 fixes committed alongside this report. This is an experimental backend: the
 results do **not** establish that it can replace PostgreSQL in production.
