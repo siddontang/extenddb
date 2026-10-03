@@ -111,18 +111,25 @@ pub async fn handle_batch_write_item(
     let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
+    // Complete schema-dependent validation for every table before the first
+    // mutation. A bad item late in a batch must not leave earlier writes behind.
+    let mut schemas = HashMap::new();
     for (table_name, reqs) in &input.request_items {
         let key_info = ctx
             .storage
             .table_key_info(&ctx.account_id, table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
-
-        // Validate: no duplicate keys within the same table (using key schema)
         validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
-
-        let view_type = stream_capture::stream_view_type(&key_info);
-
+        let indexes: Vec<_> = key_info
+            .global_secondary_indexes
+            .iter()
+            .chain(&key_info.local_secondary_indexes)
+            .map(|index| extenddb_core::validation::IndexKeyRef {
+                index_name: &index.index_name,
+                key_schema: &index.key_schema,
+            })
+            .collect();
         for wr in reqs {
             if let Some(put) = &wr.put_request {
                 validate_batch_item_keys(
@@ -134,15 +141,35 @@ pub async fn handle_batch_write_item(
                 validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
                 validate_attribute_name_sizes(&put.item, &ctx.limits)?;
                 validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
+                extenddb_core::validation::validate_index_keys(
+                    &put.item,
+                    &indexes,
+                    &key_info.attribute_definitions,
+                )?;
                 extenddb_core::validation::validate_vector_write(
                     &put.item,
                     &key_info.vector_indexes,
                     &key_info.attribute_definitions,
                 )?;
+            } else if let Some(del) = &wr.delete_request {
+                validate_batch_key_only(
+                    &del.key,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )?;
+            }
+        }
+        schemas.insert(table_name, key_info);
+    }
+    for (table_name, reqs) in &input.request_items {
+        let key_info = &schemas[table_name];
+        let view_type = stream_capture::stream_view_type(key_info);
 
+        for wr in reqs {
+            if let Some(put) = &wr.put_request {
                 collect_icm_if_needed(
                     input.return_item_collection_metrics,
-                    &key_info,
+                    key_info,
                     &put.item,
                     table_name,
                     &mut all_icm,
@@ -160,7 +187,7 @@ pub async fn handle_batch_write_item(
                 let old_item = ctx
                     .storage
                     .put_item(
-                        &key_info,
+                        key_info,
                         put.item.clone(),
                         need_old_for_stream || want_index_cc,
                         None,
@@ -174,7 +201,7 @@ pub async fn handle_batch_write_item(
                         old_item.as_ref(),
                         Some(&put.item),
                         false,
-                        &key_info,
+                        key_info,
                     );
                     let g = per_table_gsi.entry(table_name.clone()).or_default();
                     for (name, cu) in gsi {
@@ -186,15 +213,9 @@ pub async fn handle_batch_write_item(
                     }
                 }
             } else if let Some(del) = &wr.delete_request {
-                validate_batch_key_only(
-                    &del.key,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-
                 collect_icm_if_needed(
                     input.return_item_collection_metrics,
-                    &key_info,
+                    key_info,
                     &del.key,
                     table_name,
                     &mut all_icm,
@@ -214,7 +235,7 @@ pub async fn handle_batch_write_item(
                 let old_item = ctx
                     .storage
                     .delete_item(
-                        &key_info,
+                        key_info,
                         &del.key,
                         need_old_for_stream || want_index_cc,
                         None,
@@ -228,7 +249,7 @@ pub async fn handle_batch_write_item(
                         old_item.as_ref(),
                         None,
                         false,
-                        &key_info,
+                        key_info,
                     );
                     let g = per_table_gsi.entry(table_name.clone()).or_default();
                     for (name, cu) in gsi {
