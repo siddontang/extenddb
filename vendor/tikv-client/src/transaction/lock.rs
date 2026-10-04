@@ -93,7 +93,7 @@ pub async fn resolve_locks(
             Some(&commit_version) => Some(commit_version),
             None => {
                 // TODO: handle primary mismatch error.
-                let status = lock_resolver
+                let status = match lock_resolver
                     .get_txn_status_from_lock(
                         OPTIMISTIC_BACKOFF,
                         &lock,
@@ -103,7 +103,20 @@ pub async fn resolve_locks(
                         pd_client.clone(),
                         keyspace,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(status) => status,
+                    // The primary may not yet be written while this live
+                    // optimistic secondary is visible. Exhausting the short
+                    // status-lookup budget does not decide that transaction's
+                    // outcome. Keep the lock in the request plan's bounded
+                    // live-lock retry loop; never roll it back before its TTL.
+                    Err(Error::TxnNotFound(_)) => {
+                        live_locks.push(lock.clone());
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 match &status.kind {
                     TransactionStatusKind::Committed(ts) => {
                         let commit_version = ts.version();
@@ -687,6 +700,80 @@ mod tests {
                 assert_eq!(*checks.lock().unwrap(), [false]);
             }
         }
+    }
+
+    /// A bounded lookup can finish before a live primary appears. The outer
+    /// request plan must receive a live lock and retain its own retry budget.
+    /// A later pass resolves the committed transaction without any rollback.
+    #[tokio::test]
+    #[serial]
+    async fn live_missing_primary_remains_retryable_then_resolves() {
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let phase = committed.clone();
+        let observed = checks.clone();
+        let resolved = resolutions.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    assert!(!req.rollback_if_not_exist);
+                    let response = if phase.load(Ordering::SeqCst) {
+                        kvrpcpb::CheckTxnStatusResponse {
+                            commit_version: 3,
+                            ..Default::default()
+                        }
+                    } else {
+                        kvrpcpb::CheckTxnStatusResponse {
+                            error: Some(kvrpcpb::KeyError {
+                                txn_not_found: Some(kvrpcpb::TxnNotFound {
+                                    start_ts: req.lock_ts,
+                                    primary_key: req.primary_key.clone(),
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }
+                    };
+                    return Ok(Box::new(response) as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::ResolveLockRequest>() {
+                    assert!(phase.load(Ordering::SeqCst));
+                    assert_eq!(req.start_version, 1);
+                    assert_eq!(req.commit_version, 3);
+                    resolved.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected lock recovery request");
+            },
+        )));
+        let lock = kvrpcpb::LockInfo {
+            key: vec![2],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            ..Default::default()
+        };
+        let live = resolve_locks(
+            vec![lock.clone()],
+            Timestamp::default(),
+            client.clone(),
+            Keyspace::Disable,
+        )
+        .await
+        .unwrap();
+        assert_eq!(live, vec![lock.clone()]);
+        assert!(checks.load(Ordering::SeqCst) > 1);
+        assert_eq!(resolutions.load(Ordering::SeqCst), 0);
+        committed.store(true, Ordering::SeqCst);
+        assert!(
+            resolve_locks(live, Timestamp::default(), client, Keyspace::Disable)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
     }
 
     #[rstest::rstest]

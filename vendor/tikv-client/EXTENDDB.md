@@ -6,7 +6,7 @@ manifest, generated protocol types and tests are retained. CI metadata, the
 upstream toolchain override and registry extraction markers are omitted.
 Trailing whitespace in upstream design notes and protocol source is normalized.
 
-The only production-code backport is in `src/transaction/lock.rs`:
+Production changes are confined to `src/transaction/lock.rs`:
 `check_txn_status` accepts `MultipleKeyErrors` as well as `ExtractedErrors`.
 The region retry plan produces the former, so previously the typed
 `TxnNotFound` result never reached the existing lock-TTL recovery loop.
@@ -23,3 +23,14 @@ both expired and live orphan locks, rather than only testing an enum match.
 Remove the workspace patch after a released client incorporates the fix and
 passes these regressions plus ExtendDB's real-cluster contracts. Do not edit
 the Cargo registry cache: this vendored source makes builds reproducible.
+
+The merged SDK run also exposed a live optimistic lock whose primary remained
+absent after the short status-lookup retry budget. `resolve_locks` now returns
+that unresolved lock to the outer request plan's existing bounded live-lock
+retry loop. It does not declare the transaction committed or rolled back, does
+not force rollback before TTL expiry, and does not change application commit
+retry classification. A mock transport test keeps the primary absent through
+the inner retry budget, verifies no rollback/resolve request, then publishes a
+commit and checks the exact secondary resolution. This complements the expired
+primary test above. The TiDB Rust client's retry-owner flow provided the
+reference for retaining a request-level retry budget beyond a status lookup.
