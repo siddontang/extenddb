@@ -9,6 +9,18 @@ use aws_sdk_dynamodb::types::{
     ReturnConsumedCapacity, ScalarAttributeType,
 };
 
+/// Throttling is the observation under test. SDK retries wait for tokens to
+/// refill and can turn every throttled request into an eventual success.
+fn no_retry_client() -> aws_sdk_dynamodb::Client {
+    aws_sdk_dynamodb::Client::from_conf(
+        client()
+            .config()
+            .to_builder()
+            .retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+            .build(),
+    )
+}
+
 async fn create_on_demand_table(name: &str) {
     let c = client();
     c.create_table()
@@ -222,7 +234,7 @@ async fn provisioned_table_write_throttling() {
     if is_real_dynamodb() {
         return;
     }
-    let c = client();
+    let c = no_retry_client();
     let table = format!("ThrottleProvW_{}", ts());
     create_provisioned_table(&table, 5, 1).await;
 
@@ -250,12 +262,12 @@ async fn provisioned_table_write_throttling() {
         }
     }
 
+    c.delete_table().table_name(&table).send().await.ok();
+    assert_eq!(succeeded + throttled, 50, "unexpected non-throttling errors");
     assert!(
         throttled > 0,
         "Expected some writes throttled (1 WCU). Succeeded: {succeeded}, Throttled: {throttled}"
     );
-
-    c.delete_table().table_name(&table).send().await.ok();
 }
 
 #[tokio::test]
@@ -264,7 +276,7 @@ async fn provisioned_table_read_throttling() {
     if is_real_dynamodb() {
         return;
     }
-    let c = client();
+    let c = no_retry_client();
     let table = format!("ThrottleProvR_{}", ts());
     create_provisioned_table(&table, 1, 5).await;
 
@@ -300,10 +312,10 @@ async fn provisioned_table_read_throttling() {
         }
     }
 
+    c.delete_table().table_name(&table).send().await.ok();
+    assert_eq!(succeeded + throttled, 50, "unexpected non-throttling errors");
     assert!(
         throttled > 0,
         "Expected some reads throttled (1 RCU). Succeeded: {succeeded}, Throttled: {throttled}"
     );
-
-    c.delete_table().table_name(&table).send().await.ok();
 }

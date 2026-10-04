@@ -16,6 +16,9 @@ The child receives HTTPS endpoints, region, temporary credentials, CA paths,
 and a canonical temporary directory allowed for account-scoped import/export.
 Inherited config overrides and AWS session tokens are removed. The default
 test settings enable throttling and a 50ms control-plane transition delay.
+Use --setting KEY=VALUE for explicit runtime test levers. --artifacts-dir keeps
+the server log and a credential-free run manifest after the temporary namespace
+has been cleaned up; external test assertions are never modified.
 """
 from __future__ import annotations
 import argparse
@@ -59,6 +62,13 @@ def test_environment(parent: dict[str, str], endpoint: str, binary: str, passwor
                DYNAMODB_ENDPOINT=endpoint, EXTENDDB_ENDPOINT=endpoint, EXTENDDB_BINARY=binary)
     return env
 
+
+def parse_setting(value: str) -> tuple[str, str]:
+    key, separator, setting = value.partition('=')
+    if not separator or not key or not setting:
+        raise argparse.ArgumentTypeError('Expected a nonempty KEY=VALUE setting')
+    return key, setting
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--pd-endpoints', default=os.environ.get('TIKV_PD_ENDPOINTS', '127.0.0.1:2379'))
@@ -70,8 +80,16 @@ def main() -> int:
                         help='Explicit test setting; disable only for a labeled comparison run')
     parser.add_argument('--command', action='store_true', help='Run the argv after -- instead of pytest, with isolated test credentials and endpoints')
     parser.add_argument('--workdir', type=Path, default=ROOT, help='Working directory for the test command')
+    parser.add_argument('--setting', type=parse_setting, action='append', default=[], metavar='KEY=VALUE')
+    parser.add_argument('--artifacts-dir', type=Path, help='Keep server.log and a run manifest after cleanup')
     parser.add_argument('pytest_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    settings = dict(control_plane_delay_seconds='0.05', index_propagation_delay_ms='0',
+                    throttling_enabled=args.throttling)
+    settings.update(args.setting)
+    if args.artifacts_dir:
+        args.artifacts_dir = args.artifacts_dir.resolve()
+        args.artifacts_dir.mkdir(parents=True, exist_ok=True)
     tests = args.pytest_args
     if tests[:1] == ['--']:
         tests = tests[1:]
@@ -122,9 +140,7 @@ def main() -> int:
             env['EXTENDDB_CONFIG'] = str(config)
             # Match devtools/run-tests: exercise lifecycle transitions and real
             # capacity enforcement instead of silently disabling those tests.
-            for name, value in [('control_plane_delay_seconds', '0.05'),
-                                ('index_propagation_delay_ms', '0'),
-                                ('throttling_enabled', args.throttling)]:
+            for name, value in settings.items():
                 subprocess.run([binary, 'settings', '--config', str(config), 'set', name, value],
                                env=env, cwd=ROOT, check=True)
             with logfile.open('w') as log:
@@ -166,8 +182,19 @@ def main() -> int:
                 except subprocess.TimeoutExpired:
                     server.kill()
                     server.wait()
-            if initialized:
-                subprocess.run([binary, 'destroy', '--config', str(config), '--yes'], env=env, cwd=ROOT, check=True)
+            try:
+                if initialized:
+                    subprocess.run([binary, 'destroy', '--config', str(config), '--yes'], env=env, cwd=ROOT, check=True)
+            finally:
+                # A failed cleanup is especially important to diagnose; retain
+                # evidence before TemporaryDirectory removes the server log.
+                if args.artifacts_dir:
+                    if logfile.exists():
+                        shutil.copy2(logfile, args.artifacts_dir / 'server.log')
+                    (args.artifacts_dir / 'run.json').write_text(json.dumps({
+                        'backend': args.backend, 'settings': settings,
+                        'command': tests or DEFAULT_SUITES,
+                    }, indent=2) + '\n')
 
 if __name__ == '__main__':
     raise SystemExit(main())
