@@ -1,5 +1,9 @@
 # Failure analysis and repairs: 2026-10-03 UTC
 
+The subsequent [branch integration report](testing-merge-20261004.md) records
+Vector/IAM/streaming-backup/PITR integration, follow-up fixes and new tests.
+The results and unsupported-feature statements below retain this earlier checkpoint.
+
 This follows the [full local test run](testing-full-20261003.md), whose source
 was `c7f057e`. Product fixes end at `500d538` on `codex/tikv-backend`. Failures are grouped by root
 cause and impact below; a failing-case count is not a count of independent bugs.
