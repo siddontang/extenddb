@@ -127,6 +127,11 @@ impl MetadataEngine for SqliteEngine {
         Box::pin(async move {
             // D1: every writer holds the engine write lock.
             let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             for tag in &tags {
                 sqlx::query(
                     "INSERT INTO tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?) \
@@ -135,10 +140,25 @@ impl MetadataEngine for SqliteEngine {
                 .bind(&arn)
                 .bind(&tag.key)
                 .bind(&tag.value)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT tag_key, tag_value FROM tags WHERE resource_arn = ?")
+                    .bind(&arn)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let merged: Vec<Tag> = rows
+                .into_iter()
+                .map(|(key, value)| Tag { key, value })
+                .collect();
+            extenddb_core::validation::tags::validate_tags(&merged)
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             Ok(())
         })
     }

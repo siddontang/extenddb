@@ -116,7 +116,7 @@ fn build_client() -> Client {
         .behavior_version_latest()
         .region(Region::new(region))
         .credentials_provider(creds_provider)
-        .http_client(http_client);
+        .http_client(crate::runtime_http::shared_runtime(http_client));
 
     if let Some(ep) = endpoint {
         config_builder = config_builder.endpoint_url(ep);
@@ -358,12 +358,17 @@ async fn create_table_with_gsi(
     create_table_raw(c, name, hash_key, range_key, attr_defs, Some(vec![gsi])).await;
 }
 
-/// Poll DescribeTable until ACTIVE (up to 60s).
+/// Poll until the table and every GSI are ACTIVE (up to 60s).
+/// A table can already be ACTIVE while a newly added GSI is backfilling.
 pub async fn wait_for_active(c: &Client, name: &str) {
     for _ in 0..60 {
         if let Ok(resp) = c.describe_table().table_name(name).send().await {
             if let Some(table) = resp.table() {
-                if table.table_status() == Some(&TableStatus::Active) {
+                if table.table_status() == Some(&TableStatus::Active)
+                    && table.global_secondary_indexes().iter().all(|index| {
+                        index.index_status() == Some(&aws_sdk_dynamodb::types::IndexStatus::Active)
+                    })
+                {
                     return;
                 }
             }

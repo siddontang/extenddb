@@ -7,6 +7,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     ListTagsOfResourceInput, ListTagsOfResourceOutput, TagResourceInput, UntagResourceInput,
 };
+use extenddb_core::validation::tags::{validate_tag_members, validate_tags};
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -86,6 +87,15 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         )));
     }
 
+    if resource
+        .strip_prefix("table/")
+        .is_none_or(|name| name.is_empty() || name.contains('/'))
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
+        )));
+    }
+
     let table_name = extract_table_name_from_arn(arn).ok_or_else(|| {
         DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: \
@@ -120,7 +130,9 @@ pub async fn handle_tag_resource(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    validate_tag_members(&body, true)?;
     let input: TagResourceInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    validate_tags(&input.tags)?;
 
     if input.resource_arn.is_empty() {
         return Err(DynamoDbError::ValidationException(
@@ -133,7 +145,7 @@ pub async fn handle_tag_resource(
     ctx.storage
         .tag_resource(&input.resource_arn, &input.tags)
         .await
-        .map_err(sanitize_storage_error)?;
+        .map_err(crate::create_table::storage_err_to_dynamo)?;
 
     // Drop any cached resource-tag entry so the new tags are visible to
     // ABAC policy evaluation immediately.

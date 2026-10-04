@@ -406,6 +406,9 @@ async fn execute_transact_write_op(
                 *return_values_on_ccf,
                 existing.as_ref(),
             )?;
+            if existing.is_none() && !expression::update_creates_item(actions) {
+                return Ok((None, None));
+            }
             let mut item = existing.clone().unwrap_or_else(|| (*key).clone());
             expression::apply_update_validated(
                 actions,
@@ -415,7 +418,7 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
+            validation::validate_update_item_size(&item, max_item_size_bytes).map_err(|e| {
                 TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
             })?;
             // Secondary-index key validation on the post-update item: a type

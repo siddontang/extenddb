@@ -46,6 +46,13 @@ pub const KNOWN_KEYS: &[(&str, Validator)] = &[
         extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS,
         validate_backfill_batch_delay_ms,
     ),
+    // Make the existing backend publication floor configurable through both
+    // supported settings surfaces, with the same bounded duration as the other
+    // vector lifecycle levers.
+    (
+        extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS,
+        validate_backfill_batch_delay_ms,
+    ),
 ];
 
 /// Read-only keys that cannot be changed via the settings API.

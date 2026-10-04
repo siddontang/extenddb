@@ -21,6 +21,8 @@ mod search_condition;
 mod tokenizer;
 mod update_evaluator;
 mod update_parser;
+mod validation;
+pub use validation::{validate_condition_functions, validate_update_paths};
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
 pub use evaluator::evaluate_condition;
@@ -40,5 +42,5 @@ pub use search_condition::{
     validate_search_condition_expression,
 };
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
-pub use update_evaluator::apply_update_validated;
-pub use update_parser::{parse_update, parse_update_from};
+pub use update_evaluator::{apply_update_validated, update_creates_item};
+pub use update_parser::{parse_update, parse_update_from, parse_update_from_with_depth_limit};

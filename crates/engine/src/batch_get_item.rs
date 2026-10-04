@@ -52,6 +52,9 @@ pub async fn handle_batch_get_item(
 
     // Validate: per-table keys <= 100
     for (table_name, ka) in &input.request_items {
+        extenddb_core::validation::legacy::validate_attributes_to_get(
+            ka.attributes_to_get.as_deref(),
+        )?;
         if ka.keys.len() > MAX_BATCH_GET_KEYS {
             return Err(DynamoDbError::ValidationException(format!(
                 "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: \

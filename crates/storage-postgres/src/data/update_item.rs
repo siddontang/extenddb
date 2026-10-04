@@ -173,6 +173,10 @@ impl PostgresEngine {
                 Err(e) => return Err(e),
             }
 
+            if old_json.is_none() && !expression::update_creates_item(actions) {
+                return Ok((None, None));
+            }
+
             // Apply update actions and validate the resulting image against the
             // table's vector indexes: vector validity is a property of the stored
             // value, and expression-form checks cannot cover if_not_exists /
@@ -187,7 +191,7 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
 
             // Validate post-update item size (400 KB limit)
-            validation::validate_item_size(&item, self.max_item_size_bytes)
+            validation::validate_update_item_size(&item, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
             let new_item = if return_new { Some(item.clone()) } else { None };

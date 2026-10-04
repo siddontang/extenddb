@@ -43,6 +43,12 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
         );
     }
     let app_config = config::load(&args.config)?;
+    if app_config.storage.backend != "postgres" {
+        anyhow::bail!(
+            "catalog-check inspects PostgreSQL physical tables and is unavailable for backend '{}'; use extenddb verify for backend health checks",
+            app_config.storage.backend
+        );
+    }
     let port = app_config.server.port;
     let run_dir = config::expand_tilde(&app_config.server.run_dir);
 

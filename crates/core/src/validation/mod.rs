@@ -1,6 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
+pub mod legacy;
 pub mod number;
+pub mod query;
+pub mod streams;
+pub mod tags;
 pub mod vector_item;
 
 pub use vector_item::{
@@ -111,6 +115,9 @@ pub fn validate_create_table(
     validate_index_projections(input)?;
     validate_vector_indexes(input)?;
     validate_stream_specification(input)?;
+    if let Some(tags) = &input.tags {
+        tags::validate_tags(tags)?;
+    }
     Ok(())
 }
 
@@ -745,12 +752,17 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
                 }
                 if hash.attribute_name != *table_hash_key {
                     return Err(DynamoDbError::ValidationException(
-                        "One or more parameter values were invalid: Table KeySchema: The HASH key of a local secondary index must be the same as the HASH key of the table".to_owned(),
+                        "One or more parameter values were invalid: Table KeySchema: The hash key of a local secondary index must be the same as the hash key of the table".to_owned(),
                     ));
                 }
                 if range.key_type != KeyType::Range {
                     return Err(DynamoDbError::ValidationException(
                         "One or more parameter values were invalid: Index KeySchema: The second KeySchemaElement is not a RANGE type".to_owned(),
+                    ));
+                }
+                if range.attribute_name == hash.attribute_name {
+                    return Err(DynamoDbError::ValidationException(
+                        "Local secondary index hash key and range key must not be the same".into(),
                     ));
                 }
             }
@@ -772,6 +784,15 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
 }
 
 fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    let mut unique = std::collections::HashSet::new();
+    for definition in &input.attribute_definitions {
+        if !unique.insert(&definition.attribute_name) {
+            return Err(DynamoDbError::ValidationException(format!(
+                "Duplicate AttributeName in AttributeDefinitions: {}",
+                definition.attribute_name
+            )));
+        }
+    }
     // A vector attribute must NOT be declared in AttributeDefinitions, and this is
     // checked before anything else here because the attribute may simultaneously be
     // a legitimate key attribute: without this, naming the table's own partition key
@@ -1309,6 +1330,10 @@ fn validate_key_attribute_type(
         )));
     }
 
+    if let AttributeValue::N(number) = value {
+        number::validate_and_normalize_number(number)?;
+    }
+
     Ok(())
 }
 
@@ -1529,7 +1554,7 @@ pub fn validate_select_projection(
     has_index_name: bool,
     is_query: bool,
 ) -> Result<(), DynamoDbError> {
-    if has_projection {
+    if has_projection || has_attributes_to_get {
         let incompatible = match select {
             Some(Select::AllAttributes) => Some("ALL_ATTRIBUTES"),
             Some(Select::AllProjectedAttributes) => Some("ALL_PROJECTED_ATTRIBUTES"),
@@ -1539,8 +1564,12 @@ pub fn validate_select_projection(
         if let Some(what) = incompatible {
             // Real DynamoDB prepends "1 validation error detected: " to this
             // rejection for Query, but NOT for Scan.
-            let body =
-                format!("Cannot specify the ProjectionExpression when choosing to get {what}");
+            let parameter = if has_projection {
+                "ProjectionExpression"
+            } else {
+                "AttributesToGet"
+            };
+            let body = format!("Cannot specify the {parameter} when choosing to get {what}");
             let msg = if is_query {
                 format!("1 validation error detected: {body}")
             } else {
@@ -1782,6 +1811,16 @@ pub fn validate_item_size(item: &Item, max_bytes: usize) -> Result<(), DynamoDbE
         ));
     }
     Ok(())
+}
+
+/// Apply the same stored-size bound with UpdateItem's operation-specific error.
+/// Transaction updates retain this message in their cancellation reason.
+pub fn validate_update_item_size(item: &Item, max_bytes: usize) -> Result<(), DynamoDbError> {
+    validate_item_size(item, max_bytes).map_err(|_| {
+        DynamoDbError::ValidationException(
+            "Item size to update has exceeded the maximum allowed size".into(),
+        )
+    })
 }
 
 /// Validate all number values in an item are within `DynamoDB` limits.

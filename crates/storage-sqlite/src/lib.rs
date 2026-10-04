@@ -176,9 +176,6 @@ use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 use crate::hooks::SqliteRuntimeHooks;
 
-/// Maximum DynamoDB item size in bytes (post-update validation bound).
-const MAX_ITEM_SIZE_BYTES: usize = 400_000;
-
 fn sqlite_server_components_factory(
     config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
@@ -188,12 +185,17 @@ fn sqlite_server_components_factory(
     let pool_size = config.max_connections();
     let region = region.to_owned();
     Box::pin(async move {
-        let engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "sqlite".to_owned(),
-                details: e.to_string(),
-            })?;
+        let engine = SqliteEngine::new(
+            &db_path,
+            pool_size,
+            &region,
+            extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
+        )
+        .await
+        .map_err(|e| BackendError::ConnectionFailed {
+            backend: "sqlite".to_owned(),
+            details: e.to_string(),
+        })?;
 
         // In-memory databases do not persist across the `init` process, so the
         // catalog must be bootstrapped here, at serve time, on the engine's own

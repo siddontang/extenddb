@@ -178,6 +178,13 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
 | `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building. The pause is outside the batch transaction, so writes are still accepted throughout, but it does extend the per-table propagation hold: no index on that table advances while the build runs, GSIs included, and the accepted range goes up to 60 s per batch. |
 | `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Without it the phase lasts only from the `UpdateTable` transaction, which inserts the row as `CREATING` with `Backfilling: false`, until the detached build task flips the flag, which is a window no client can time reliably rather than one that cannot exist. |
+| `vector_index_min_creating_ms` | `1000` | Minimum duration of the online vector index's CREATING state; 0 disables the floor. Accepted range: 0–60000 ms. It never publishes an unfinished backfill. A longer floor makes lifecycle observations reproducible with slow client polling. |
+
+TiKV persists allocation, inter-batch and publication deadlines instead of
+sleeping in its maintenance worker. Its base and index writes remain synchronous
+during backfill, so the propagation hold described above for the SQL backends
+does not apply to TiKV. Changing allocation or minimum-creating settings affects
+new builds; the batch delay is read at each batch commit.
 
 ```bash
 # View current settings
@@ -599,3 +606,41 @@ See [LICENSE](../../LICENSE) for the full text.
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
 of Amazon.com, Inc.
+
+## Additional lifecycle and backend options
+
+The CLI help (`extenddb <command> --help`) is the reference for the options
+compiled into a particular binary. `serve --port` overrides the listener port;
+`status --port`, `stop --port` and `healthcheck --port` select the target port.
+`catalog-check --fix` repairs orphaned physical tables; omit `--fix` to report
+findings without repair.
+
+During initialization, `--extenddb-user` and `--extenddb-pass` choose the
+PostgreSQL application role. Prefer `EXTENDDB_APP_PASSWORD` for its password to
+avoid exposing it in process arguments. `--no-overwrite` is the default and
+refuses an existing configuration file; `--overwrite` explicitly replaces that
+file. Repeat `--tls-san` to add DNS names or IP addresses to the generated TLS
+certificate. These flags do not change which storage backend was compiled.
+
+For a TiKV build, `init --tikv-pd-endpoints 127.0.0.1:2379 --tikv-namespace dev`
+selects PD endpoints and a deployment namespace. Each deployment needs a unique
+namespace; this is logical isolation, not an access-control boundary. See the
+[TiKV backend guide](../../crates/storage-tikv/README.md) for experimental limits
+and backup behavior.
+
+Additional configuration fields in `extenddb.sample.toml` include:
+
+| Field | Meaning |
+|---|---|
+| `limits.max_attribute_name_bytes` | Maximum UTF-8 bytes in an attribute name; default 65,535. |
+| `limits.allow_multipart_table_keys` | Enables the multipart base-table-key preview; default false. |
+| `storage.mongodb.max_catalog_connections` | Catalog and authorization connection-pool size; default 20. |
+| `storage.mongodb.transaction_read_concern` | Default `snapshot`; `majority` and `local` are compatibility options that weaken snapshot guarantees. |
+| `max_import_bytes` | Top-level maximum input size for an import; default 10 GiB. Place it before any section header. |
+| `import_export_root` | Deprecated top-level compatibility field. It fills an import/export root list only when that list is empty. Prefer separate `[import]` and `[export]` paths; placing this top-level key inside a section is rejected. |
+
+Runtime settings also expose `data_database_name` and
+`data_database_connection_string` as read-only catalog information. They cannot
+be changed with `settings set`. `gsi_propagation_delay_ms` is a deprecated writable
+alias for `index_propagation_delay_ms`; writes to the alias update the canonical
+setting rather than creating a separate delay.

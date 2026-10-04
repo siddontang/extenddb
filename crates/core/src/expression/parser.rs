@@ -134,23 +134,21 @@ fn parse_primary(
     }
 
     // Try function call: ident followed by '('
-    if let Token::Ident(name) = &tokens[*pos] {
-        let fn_name_lower = name.to_ascii_lowercase();
-        if is_function_name(&fn_name_lower)
-            && *pos + 1 < tokens.len()
-            && tokens[*pos + 1] == Token::LParen
-        {
-            return parse_function_call(tokens, pos);
-        }
+    if let Token::Ident(name) = &tokens[*pos]
+        && name != "size"
+        && *pos + 1 < tokens.len()
+        && tokens[*pos + 1] == Token::LParen
+    {
+        return parse_function_call(tokens, pos, depth, max_depth);
     }
 
     // Operand — then check for comparator, BETWEEN, or IN
-    let left = parse_operand(tokens, pos)?;
+    let left = parse_operand(tokens, pos, depth, max_depth)?;
 
     if *pos < tokens.len() {
         if let Some(op) = try_comparator(&tokens[*pos]) {
             *pos += 1;
-            let right = parse_operand(tokens, pos)?;
+            let right = parse_operand(tokens, pos, depth, max_depth)?;
             return Ok(Expr::Compare {
                 left: Box::new(left),
                 op,
@@ -161,9 +159,9 @@ fn parse_primary(
         // BETWEEN operand AND operand
         if tokens[*pos] == Token::Between {
             *pos += 1;
-            let low = parse_operand(tokens, pos)?;
+            let low = parse_operand(tokens, pos, depth, max_depth)?;
             parser_common::expect_token(tokens, pos, &Token::And, "AND", "ConditionExpression")?;
-            let high = parse_operand(tokens, pos)?;
+            let high = parse_operand(tokens, pos, depth, max_depth)?;
             return Ok(Expr::Between {
                 operand: Box::new(left),
                 low: Box::new(low),
@@ -175,10 +173,10 @@ fn parse_primary(
         if tokens[*pos] == Token::In {
             *pos += 1;
             parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
-            let mut list = vec![parse_operand(tokens, pos)?];
+            let mut list = vec![parse_operand(tokens, pos, depth, max_depth)?];
             while *pos < tokens.len() && tokens[*pos] == Token::Comma {
                 *pos += 1;
-                list.push(parse_operand(tokens, pos)?);
+                list.push(parse_operand(tokens, pos, depth, max_depth)?);
             }
             parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
             return Ok(Expr::In {
@@ -194,7 +192,12 @@ fn parse_primary(
     ))
 }
 
-fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_operand(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err(
             "Invalid ConditionExpression: expected operand",
@@ -209,11 +212,8 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
         }
         Token::Ident(name) => {
             // size(path) is a function that returns a value, usable as an operand
-            if name.eq_ignore_ascii_case("size")
-                && *pos + 1 < tokens.len()
-                && tokens[*pos + 1] == Token::LParen
-            {
-                return parse_function_call(tokens, pos);
+            if name == "size" && *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
+                return parse_function_call(tokens, pos, depth, max_depth);
             }
             let elements = parser_common::parse_path(tokens, pos)?;
             Ok(Expr::Path(elements))
@@ -223,35 +223,52 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
             Ok(Expr::Path(elements))
         }
         _ => Err(validation_err(
-            "Invalid ConditionExpression: expected attribute path or value placeholder",
+            "Invalid ConditionExpression: Syntax error; expected attribute path or value placeholder",
         )),
     }
 }
 
-fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_function_call(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
+    if *depth >= max_depth {
+        return Err(validation_err(
+            "Invalid ConditionExpression: expression nesting depth exceeded",
+        ));
+    }
+    *depth += 1;
     let name = match &tokens[*pos] {
-        Token::Ident(n) => n.to_ascii_lowercase(),
+        Token::Ident(n) => n.clone(),
         _ => {
             return Err(validation_err(
                 "Invalid ConditionExpression: expected function name",
             ));
         }
     };
+    if !is_function_name(&name) && name != "size" {
+        return Err(validation_err(&format!(
+            "Invalid ConditionExpression: function {name} is not allowed"
+        )));
+    }
     *pos += 1;
 
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
 
     let mut args = Vec::new();
     if *pos < tokens.len() && tokens[*pos] != Token::RParen {
-        args.push(parse_operand(tokens, pos)?);
+        args.push(parse_operand(tokens, pos, depth, max_depth)?);
         while *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
-            args.push(parse_operand(tokens, pos)?);
+            args.push(parse_operand(tokens, pos, depth, max_depth)?);
         }
     }
 
     parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
 
+    *depth -= 1;
     Ok(Expr::Function { name, args })
 }
 
@@ -287,6 +304,29 @@ mod tests {
     fn parse(input: &str) -> Result<Expr, DynamoDbError> {
         let tokens = tokenize(input)?;
         parse_condition(&tokens)
+    }
+
+    #[test]
+    fn function_nesting_uses_the_condition_depth_budget() {
+        let parse =
+            |text: &str, limit| parse_condition_with_depth_limit(&tokenize(text).unwrap(), limit);
+        assert!(parse("size(size(a)) = :v", 2).is_ok());
+        assert!(parse("NOT size(size(a)) = :v", 2).is_err());
+        assert!(parse("NOT size(size(a)) = :v", 3).is_ok());
+        // Completed siblings release their budget; width is not nesting.
+        assert!(parse("size(a) = :v AND size(b) = :v", 1).is_ok());
+        for close in [true, false] {
+            let mut text = "size(".repeat(500);
+            text.push('a');
+            if close {
+                text.push_str(&")".repeat(500));
+                text.push_str(" = :v");
+            }
+            assert!(matches!(
+                parse(&text, 150),
+                Err(DynamoDbError::ValidationException(_))
+            ));
+        }
     }
 
     #[test]

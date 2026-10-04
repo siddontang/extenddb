@@ -16,6 +16,14 @@ use extenddb_config as config;
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
 pub struct InitArgs {
+    /// Comma-separated TiKV PD endpoints (TiKV build only)
+    #[arg(long)]
+    tikv_pd_endpoints: Option<String>,
+
+    /// Isolated TiKV deployment namespace (TiKV build only)
+    #[arg(long)]
+    tikv_namespace: Option<String>,
+
     /// Storage backend. Optional: the binary's compiled-in backend is used;
     /// when given, it is validated against that backend.
     #[arg(long)]

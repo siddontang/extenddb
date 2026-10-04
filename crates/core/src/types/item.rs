@@ -348,11 +348,11 @@ pub fn item_size_bytes(item: &Item) -> usize {
         .sum()
 }
 
-/// Calculate the wire-format size of a single `AttributeValue`.
+/// Calculate a single `AttributeValue`'s contribution to the stored item size.
 ///
 /// `DynamoDB` sizing rules:
 /// - S: UTF-8 byte length
-/// - N: string representation length (up to 38 significant digits + sign + decimal)
+/// - N: packed significant digits, rounded separately on either side of the point
 /// - B: raw byte length
 /// - BOOL: 1 byte
 /// - NULL: 1 byte
@@ -388,36 +388,39 @@ pub fn attribute_value_size(value: &AttributeValue) -> usize {
 
 /// Calculate the `DynamoDB` size of a number in bytes.
 ///
-/// `DynamoDB` number sizing: approximately 1 byte per 2 significant digits + 1 byte.
-/// Zero is 1 byte. Negative numbers add 1 byte. Max 21 bytes.
+/// The public capacity guide gives an approximation. Byte-boundary captures
+/// additionally distinguish the integer and fractional digit groups: each group
+/// rounds up independently. Zero is one byte; other values have one overhead
+/// byte and negatives have a second. The encoding saturates at 21 bytes, even
+/// for a negative 38-digit value split into two odd-length groups (also checked
+/// against DynamoDB Local 3.3.1 at the item-size boundary).
+///
+/// Callers validate numbers separately. Deserialized values are already expanded;
+/// normalize exponent notation here too for values constructed directly in Rust.
 fn dynamodb_number_size(n: &str) -> usize {
-    let s = n.trim_start_matches('-');
-    let is_zero = s.chars().all(|c| c == '0' || c == '.');
-    if is_zero {
+    let expanded = n.contains(['e', 'E']).then(|| {
+        crate::validation::number::validate_and_normalize_number(n).unwrap_or_else(|_| n.to_owned())
+    });
+    let n = expanded.as_deref().unwrap_or(n);
+    let s = n.trim_start_matches(['-', '+']);
+    let (integer, fraction) = s.split_once('.').unwrap_or((s, ""));
+    let integer = integer.trim_start_matches('0');
+    let fraction = fraction.trim_end_matches('0');
+    let integer_digits = if fraction.is_empty() {
+        integer.trim_end_matches('0').len()
+    } else {
+        integer.len()
+    };
+    let fraction_digits = if integer.is_empty() {
+        fraction.trim_start_matches('0').len()
+    } else {
+        fraction.len()
+    };
+    if integer_digits + fraction_digits == 0 {
         return 1;
     }
-
-    let significant = if let Some(dot_pos) = s.find('.') {
-        let (int_part, frac_part) = s.split_at(dot_pos);
-        let frac = &frac_part[1..];
-        let int_trimmed = int_part.trim_start_matches('0');
-        let frac_trimmed = frac.trim_end_matches('0');
-        if int_trimmed.is_empty() {
-            let frac_sig = frac.trim_start_matches('0');
-            frac_sig.trim_end_matches('0').len()
-        } else {
-            format!("{int_trimmed}{frac_trimmed}").len()
-        }
-    } else {
-        let trimmed = s.trim_start_matches('0').trim_end_matches('0');
-        if trimmed.is_empty() { 1 } else { trimmed.len() }
-    };
-
-    let mut size = significant.div_ceil(2) + 1;
-    if n.starts_with('-') {
-        size += 1;
-    }
-    size.min(21)
+    (1 + integer_digits.div_ceil(2) + fraction_digits.div_ceil(2) + usize::from(n.starts_with('-')))
+        .min(21)
 }
 
 #[cfg(test)]
@@ -433,6 +436,62 @@ mod tests {
         assert_eq!(attribute_value_size(&s("hello")), 5);
         assert_eq!(attribute_value_size(&AttributeValue::Bool(true)), 1);
         assert_eq!(attribute_value_size(&AttributeValue::Null), 1);
+    }
+
+    #[test]
+    fn number_sizes_count_integer_and_fraction_groups_separately() {
+        for (literal, bytes) in [
+            ("0", 1),
+            ("-0", 1),
+            ("-0.00e99", 1),
+            ("1", 2),
+            ("12", 2),
+            ("123", 3),
+            ("1234", 3),
+            ("0042", 2),
+            ("100", 2),
+            ("100.00", 2),
+            ("1010", 3),
+            ("0.0000001", 2),
+            ("1E125", 2),
+            ("1E-130", 2),
+            ("1.5", 3),
+            ("15", 2),
+            ("1.2", 3),
+            ("1.200", 3),
+            ("1.234", 4),
+            ("3.14159", 5),
+            ("123456", 4),
+            ("100.5", 4),
+            ("0.15", 2),
+            ("-42", 3),
+            ("+1.5", 3),
+            ("15e-1", 3),
+            ("15e1", 2),
+            ("1.0005", 4),
+            ("12345678901234567890123456789012345678", 20),
+            ("1.2345678901234567890123456789012345678", 21),
+            ("-1.2345678901234567890123456789012345678", 21),
+        ] {
+            assert_eq!(dynamodb_number_size(literal), bytes, "{literal}");
+            let normalized =
+                crate::validation::number::validate_and_normalize_number(literal).unwrap();
+            assert_eq!(
+                dynamodb_number_size(&normalized),
+                bytes,
+                "expanded {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_sets_and_documents_use_the_same_size_rule() {
+        let numbers = AttributeValue::NS(["1.5".into(), "100.5".into(), "-42".into()].into());
+        assert_eq!(attribute_value_size(&numbers), 10);
+        let list = AttributeValue::L(vec![AttributeValue::N("3.14159".into()), numbers]);
+        assert_eq!(attribute_value_size(&list), 3 + 6 + 11);
+        let item = Item::from([("数".into(), list)]);
+        assert_eq!(item_size_bytes(&item), 23);
     }
 
     #[test]

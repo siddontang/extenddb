@@ -58,6 +58,17 @@ pub async fn handle_update_time_to_live(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    for field in ["AttributeName", "Enabled"] {
+        if body
+            .get("TimeToLiveSpecification")
+            .and_then(|spec| spec.get(field))
+            .is_none_or(Value::is_null)
+        {
+            return Err(DynamoDbError::ValidationException(format!(
+                "TimeToLiveSpecification.{field} is required"
+            )));
+        }
+    }
     let input: UpdateTimeToLiveInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -81,6 +92,15 @@ pub async fn handle_update_time_to_live(
     if !input.time_to_live_specification.enabled && !already_enabled {
         return Err(DynamoDbError::ValidationException(
             "TimeToLive is already disabled".to_owned(),
+        ));
+    }
+
+    if !input.time_to_live_specification.enabled
+        && current.attribute_name.as_deref()
+            != Some(&input.time_to_live_specification.attribute_name)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "TimeToLive is active on a different AttributeName".to_owned(),
         ));
     }
 
@@ -152,7 +172,8 @@ pub async fn handle_update_time_to_live(
 fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
     if name.is_empty() || name.len() > 255 {
         return Err(DynamoDbError::ValidationException(
-            "TimeToLiveSpecification.AttributeName must be between 1 and 255 characters".to_owned(),
+            "TimeToLiveSpecification.AttributeName length must be between 1 and 255 characters"
+                .to_owned(),
         ));
     }
     if !name
@@ -168,6 +189,7 @@ fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
 
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
+        StorageError::Validation(message) => DynamoDbError::ValidationException(message),
         StorageError::TableNotFound(_name) => {
             DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
         }

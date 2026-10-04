@@ -523,6 +523,11 @@ pub fn validate_ordering_operand_types(
     expr: &Expr,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
+    super::validation::validate_condition_functions(expr, maps)?;
+    validate_ordering_inner(expr, maps)
+}
+
+fn validate_ordering_inner(expr: &Expr, maps: &ExpressionMaps) -> Result<(), DynamoDbError> {
     match expr {
         Expr::Compare { left, op, right } => {
             if let Some(symbol) = ordering_op_symbol(*op) {
@@ -537,10 +542,10 @@ pub fn validate_ordering_operand_types(
             reject_non_orderable_literal(high, maps, "BETWEEN")
         }
         Expr::And(left, right) | Expr::Or(left, right) => {
-            validate_ordering_operand_types(left, maps)?;
-            validate_ordering_operand_types(right, maps)
+            validate_ordering_inner(left, maps)?;
+            validate_ordering_inner(right, maps)
         }
-        Expr::Not(inner) => validate_ordering_operand_types(inner, maps),
+        Expr::Not(inner) => validate_ordering_inner(inner, maps),
         _ => Ok(()),
     }
 }

@@ -280,7 +280,7 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
     while pos < tokens.len() {
         if tokens[pos] != Token::And {
             return Err(validation_err(
-                "Invalid KeyConditionExpression: only AND is supported between key conditions",
+                "Invalid KeyConditionExpression: OR is not supported between key conditions; use AND",
             ));
         }
         pos += 1;
@@ -354,7 +354,7 @@ fn classify_single(clause: RawClause) -> Result<KeyCondition, DynamoDbError> {
             extra_sk_conditions: Vec::new(),
         }),
         _ => Err(validation_err(
-            "Invalid KeyConditionExpression: partition key condition must use equality (=)",
+            "Invalid KeyConditionExpression: partition key condition must use equality (=); other operators are not supported",
         )),
     }
 }
@@ -479,9 +479,24 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         ));
     }
 
+    if let Token::Ident(name) = &tokens[*pos]
+        && tokens.get(*pos + 1) == Some(&Token::LParen)
+        && name != "begins_with"
+    {
+        return Err(validation_err(&format!(
+            "Invalid KeyConditionExpression: unknown function {name}"
+        )));
+    }
+
+    if tokens[*pos] == Token::Not {
+        return Err(validation_err(
+            "Invalid KeyConditionExpression: NOT is not supported in key conditions",
+        ));
+    }
+
     // begins_with(path, :val)
     if let Token::Ident(name) = &tokens[*pos]
-        && name.eq_ignore_ascii_case("begins_with")
+        && name == "begins_with"
         && *pos + 1 < tokens.len()
         && tokens[*pos + 1] == Token::LParen
     {

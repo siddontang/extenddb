@@ -637,7 +637,7 @@ fn server_components_factory(
         let pg_config = PostgresConfig {
             connection_string: connection_string.clone(),
             pool_size: max_connections,
-            max_item_size_bytes: 400_000,
+            max_item_size_bytes: extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
         };
 
         // Create PostgresEngine

@@ -67,6 +67,9 @@ pub async fn handle_scan(
         ],
     )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    extenddb_core::validation::legacy::validate_attributes_to_get(
+        input.attributes_to_get.as_deref(),
+    )?;
 
     // Validate Filter/Projection expressions before the existence
     // check; index resolution, Segment/Limit/Select and key checks stay after.
@@ -388,7 +391,9 @@ pub async fn handle_scan(
         ));
     }
 
-    let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
+    // As in Query, an omitted Select on an index means ALL_PROJECTED_ATTRIBUTES.
+    // An explicit ProjectionExpression still takes precedence in PostRead.
+    let index_proj = if matches!(input.select, None | Some(Select::AllProjectedAttributes)) {
         index_info.as_ref()
     } else {
         None

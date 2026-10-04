@@ -70,6 +70,9 @@ pub async fn handle_query(
         }],
     )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    extenddb_core::validation::legacy::validate_attributes_to_get(
+        input.attributes_to_get.as_deref(),
+    )?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx
@@ -272,7 +275,12 @@ pub async fn handle_query(
 
     // Correct PK/SK assignment when both clauses are equality comparisons.
     // The parser can't distinguish PK from SK without the key schema.
-    let pk_attr = &query_key_info.key_schema[0].attribute_name;
+    let pk_attr = &query_key_info
+        .key_schema
+        .iter()
+        .find(|key| key.key_type == extenddb_core::types::KeyType::Hash)
+        .ok_or_else(|| DynamoDbError::InternalServerError("Missing partition key schema".into()))?
+        .attribute_name;
     key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
 
     // Validate that the partition key is actually referenced in the condition.
@@ -317,6 +325,13 @@ pub async fn handle_query(
             )));
         }
     }
+
+    extenddb_core::validation::query::validate_query_keys(
+        &key_condition,
+        effective_maps,
+        &query_key_info.key_schema,
+        &query_key_info.attribute_definitions,
+    )?;
 
     // Parse FilterExpression or desugar legacy QueryFilter
     let (filter, filter_maps) = if let Some(ref qf) = input.query_filter {
@@ -433,8 +448,9 @@ pub async fn handle_query(
         extenddb_core::validation::IS_QUERY,
     )?;
 
-    // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
-    let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
+    // Index reads default to ALL_PROJECTED_ATTRIBUTES. Storage may return the
+    // base image for LSI reachback; trim it unless the request asks otherwise.
+    let index_proj = if matches!(input.select, None | Some(Select::AllProjectedAttributes)) {
         index_info.as_ref()
     } else {
         None
@@ -463,6 +479,11 @@ pub async fn handle_query(
 
     // Validate begins_with operand types upfront (before any rows are read).
     if let Some(ref f) = filter {
+        extenddb_core::validation::query::validate_query_filter(
+            f,
+            &combined_maps,
+            &query_key_info.key_schema,
+        )?;
         extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
         )?;

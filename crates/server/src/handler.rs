@@ -205,8 +205,11 @@ pub(crate) async fn handle_request(
 
     // --- Dispatch segment ---
     let dispatch_start = std::time::Instant::now();
-    let dispatch_result =
-        extenddb_engine::dispatch(&operation, input, &ctx, &state.server_addr).await;
+    // Authentication has verified the request's Host (or HTTP/2 authority).
+    // Advertise the address actually used by this client, including proxy port
+    // and IPv6 brackets, rather than a hard-coded localhost address.
+    let server_addr = request_endpoint(&headers, &state.server_addr);
+    let dispatch_result = extenddb_engine::dispatch(&operation, input, &ctx, server_addr).await;
     #[allow(clippy::cast_precision_loss)]
     let dispatch_us = dispatch_start.elapsed().as_micros() as f64;
     // P120c: Record storage query metrics for the request's dispatch phase.
@@ -330,4 +333,34 @@ pub(crate) async fn handle_request(
     );
 
     response
+}
+
+fn request_endpoint<'a>(headers: &'a HeaderMap, fallback: &'a str) -> &'a str {
+    headers
+        .get("host")
+        .and_then(|host| host.to_str().ok())
+        .filter(|host| !host.contains('@') && host.parse::<axum::http::uri::Authority>().is_ok())
+        .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    #[test]
+    fn advertised_endpoint_preserves_the_authenticated_authority() {
+        for host in ["127.0.0.1:8443", "[::1]:9443", "db.example.com:443"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", host.parse().unwrap());
+            assert_eq!(request_endpoint(&headers, "localhost:18443"), host);
+        }
+        for host in ["https://db.example.com", "user@db.example.com", "host/path"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", host.parse().unwrap());
+            assert_eq!(
+                request_endpoint(&headers, "localhost:18443"),
+                "localhost:18443"
+            );
+        }
+        assert_eq!(request_endpoint(&HeaderMap::new(), "fallback"), "fallback");
+    }
 }

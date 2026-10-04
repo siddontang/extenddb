@@ -27,10 +27,12 @@ use crate::error::DynamoDbError;
 ///
 /// Returns `ValidationException` for syntax errors.
 pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parser_common::check_parenthesis_depth(tokens, 150, "UpdateExpression")?;
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
     })?;
 
+    validate_unique_clauses(tokens)?;
     let mut pos = 0;
     let mut actions = Vec::new();
 
@@ -74,10 +76,24 @@ pub fn parse_update_from(
     tokens: &[Token],
     source: &str,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parse_update_from_with_depth_limit(tokens, source, 150)
+}
+
+/// Parse an update expression while bounding recursive functions and groups.
+///
+/// # Errors
+/// Returns `ValidationException` for syntax errors or excessive nesting.
+pub fn parse_update_from_with_depth_limit(
+    tokens: &[Token],
+    source: &str,
+    max_depth: usize,
+) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    parser_common::check_parenthesis_depth(tokens, max_depth, "UpdateExpression")?;
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
     })?;
 
+    validate_unique_clauses(tokens)?;
     let mut pos = 0;
     let mut actions = Vec::new();
 
@@ -118,6 +134,25 @@ pub fn parse_update_from(
     Ok(actions)
 }
 
+fn validate_unique_clauses(tokens: &[Token]) -> Result<(), DynamoDbError> {
+    let mut seen = [false; 4];
+    for token in tokens {
+        let i = match token {
+            Token::Set => 0,
+            Token::Remove => 1,
+            Token::Add => 2,
+            Token::Delete => 3,
+            _ => continue,
+        };
+        if std::mem::replace(&mut seen[i], true) {
+            return Err(validation_err(
+                "Invalid UpdateExpression: Each action keyword may appear only once",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn token_display_text(token: &Token) -> String {
     match token {
         Token::Ident(s) => s.clone(),
@@ -154,7 +189,10 @@ fn build_near_context(source: &str, token_text: &str) -> String {
         return token_text.to_owned();
     }
     if let Some(start) = source.find(token_text) {
-        let end = std::cmp::min(start + token_text.len() + 7, source.len());
+        let mut end = std::cmp::min(start + token_text.len() + 7, source.len());
+        while !source.is_char_boundary(end) {
+            end -= 1;
+        }
         source[start..end].trim_end().to_owned()
     } else {
         token_text.to_owned()
@@ -235,12 +273,8 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
             *pos += 1;
             Ok(expr)
         }
-        Token::Ident(name) => {
-            let fn_lower = name.to_ascii_lowercase();
-            if is_set_function(&fn_lower)
-                && *pos + 1 < tokens.len()
-                && tokens[*pos + 1] == Token::LParen
-            {
+        Token::Ident(_) => {
+            if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
                 parse_set_function_call(tokens, pos)
             } else {
                 parser_common::parse_path(tokens, pos).map(Expr::Path)
@@ -266,13 +300,18 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
 
 fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
-        Token::Ident(n) => n.to_ascii_lowercase(),
+        Token::Ident(n) => n.clone(),
         _ => {
             return Err(validation_err(
                 "Invalid UpdateExpression: expected function name",
             ));
         }
     };
+    if !is_set_function(&name) {
+        return Err(validation_err(&format!(
+            "Invalid UpdateExpression: Syntax error; function {name} is not allowed"
+        )));
+    }
     *pos += 1;
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "UpdateExpression")?;
 
@@ -286,6 +325,16 @@ fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dy
     }
 
     parser_common::expect_token(tokens, pos, &Token::RParen, ")", "UpdateExpression")?;
+    if args.len() != 2 {
+        return Err(validation_err(&format!(
+            "Invalid UpdateExpression: Function {name} requires 2 arguments"
+        )));
+    }
+    if name == "if_not_exists" && !matches!(args[0], Expr::Path(_)) {
+        return Err(validation_err(
+            "Invalid UpdateExpression: if_not_exists first argument must be a path",
+        ));
+    }
     Ok(Expr::Function { name, args })
 }
 
@@ -363,6 +412,33 @@ mod tests {
     fn parse(input: &str) -> Result<Vec<UpdateAction>, DynamoDbError> {
         let tokens = tokenize(input)?;
         parse_update(&tokens)
+    }
+
+    #[test]
+    fn nested_update_operands_are_bounded_before_recursion() {
+        let text = "SET a = list_append(:v, list_append(:v, :v))";
+        let tokens = tokenize(text).unwrap();
+        assert!(parse_update_from_with_depth_limit(&tokens, text, 2).is_ok());
+        assert!(parse_update_from_with_depth_limit(&tokens, text, 1).is_err());
+        let siblings = "SET a = list_append(:v, :v), b = list_append(:v, :v)";
+        assert!(
+            parse_update_from_with_depth_limit(&tokenize(siblings).unwrap(), siblings, 1).is_ok()
+        );
+        for close in [true, false] {
+            let mut text = format!("SET a = {}:v", "list_append(:v,".repeat(200));
+            if close {
+                text.push_str(&")".repeat(200));
+            }
+            let tokens = tokenize(&text).unwrap();
+            assert!(matches!(
+                parse_update(&tokens),
+                Err(DynamoDbError::ValidationException(_))
+            ));
+            assert!(matches!(
+                parse_update_from(&tokens, &text),
+                Err(DynamoDbError::ValidationException(_))
+            ));
+        }
     }
 
     #[test]

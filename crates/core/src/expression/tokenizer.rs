@@ -178,10 +178,16 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
                     max_tokens,
                 )?;
             }
-            other => {
-                let ch = other as char;
-                let near_start = i.saturating_sub(5);
-                let near_end = std::cmp::min(i + 5, input.len());
+            _ => {
+                let ch = input[i..].chars().next().unwrap_or('?');
+                let mut near_start = i.saturating_sub(5);
+                while !input.is_char_boundary(near_start) {
+                    near_start += 1;
+                }
+                let mut near_end = std::cmp::min(i + 5, input.len());
+                while !input.is_char_boundary(near_end) {
+                    near_end -= 1;
+                }
                 let near = &input[near_start..near_end];
                 return Err(validation_err(&format!(
                     "Syntax error; token: \"{ch}\", near: \"{near}\""

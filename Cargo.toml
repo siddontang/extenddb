@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
 resolver = "2"
+exclude = ["vendor/tikv-client"]
 members = [
     "crates/core",
     "crates/cache",
@@ -11,6 +12,7 @@ members = [
     "crates/storage-postgres",
     "crates/storage-mongodb",
     "crates/storage-sqlite",
+    "crates/storage-tikv",
     "crates/auth",
     "crates/server",
     "crates/app",
@@ -33,6 +35,7 @@ extenddb-config = { path = "crates/config" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
 extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
 extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
+extenddb-storage-tikv = { path = "crates/storage-tikv" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
 extenddb-app = { path = "crates/app" }
@@ -117,3 +120,7 @@ inherits = "release"
 strip = true
 lto = true
 codegen-units = 1
+
+# Audited lock-resolution backport; see vendor/tikv-client/EXTENDDB.md.
+[patch.crates-io]
+tikv-client = { path = "vendor/tikv-client" }

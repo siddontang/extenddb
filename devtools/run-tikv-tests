@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Exercise a TiKV build against an existing dedicated PD/TiKV cluster.
+
+Creates a random namespace and temporary config, runs init/serve/verify and SDK
+suites, then stops the server and destroys ONLY its namespace, including after a
+failed test. Python 3.10+, pytest, boto3 and requests are required. The normal
+init command creates/reuses ~/.extenddb/tls; those TLS files are retained.
+
+Usage: devtools/run-tikv-tests --pd-endpoints 127.0.0.1:2379 -- tests/test_query_scan.py
+
+Use --command --workdir PATH -- EXECUTABLE ARGS to run another SDK suite in
+the same isolated lifecycle. Arguments are executed directly, without a shell.
+The child receives HTTPS endpoints, region, temporary credentials, CA paths,
+and a canonical temporary directory allowed for account-scoped import/export.
+Inherited config overrides and AWS session tokens are removed. The default
+test settings enable throttling and a 50ms control-plane transition delay.
+Use --setting KEY=VALUE for explicit runtime test levers. --artifacts-dir keeps
+the server log and a credential-free run manifest after the temporary namespace
+has been cleaned up; external test assertions are never modified.
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SUITES = [
+    'tests/test_item_operations.py', 'tests/test_table_operations.py',
+    'tests/test_query_scan.py', 'tests/test_conditional_writes.py',
+    'tests/test_batch_operations.py', 'tests/test_transaction_operations.py',
+    'tests/test_cross_account_isolation.py', 'tests/test_streams.py',
+    'tests/test_ttl.py', 'tests/test_read_paging.py', 'tests/test_multipart_gsi.py',
+    'tests/test_lsi_default_projection.py', 'tests/test_table_throughput_mode.py',
+    'tests/test_update_table_billing_validation.py',
+]
+
+def test_environment(parent: dict[str, str], endpoint: str, binary: str, password: str) -> dict[str, str]:
+    """Create child-only settings; inherited config/session credentials cannot
+    redirect the temporary server or change the provisioned test account.
+    Endpoint aliases cover the Python, Rust, and Parity SDK suites.
+    """
+    env = {key: value for key, value in parent.items()
+           if not key.startswith('EXTENDDB__')
+           and not key.startswith('AWS_ENDPOINT_URL')
+           and key not in ('AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN')}
+    env.update(EXTENDDB_TEST_ENDPOINT=endpoint, EXTENDDB_ADMIN_USER='test-admin',
+               EXTENDDB_ADMIN_PASSWORD=password, AWS_DEFAULT_REGION='us-east-1',
+               AWS_REGION='us-east-1', AWS_EC2_METADATA_DISABLED='true',
+               EXTENDDB_TEST_ACCOUNT_ID='123456789012',
+               DYNAMODB_ENDPOINT=endpoint, EXTENDDB_ENDPOINT=endpoint, EXTENDDB_BINARY=binary)
+    return env
+
+
+def parse_setting(value: str) -> tuple[str, str]:
+    key, separator, setting = value.partition('=')
+    if not separator or not key or not setting:
+        raise argparse.ArgumentTypeError('Expected a nonempty KEY=VALUE setting')
+    return key, setting
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--pd-endpoints', default=os.environ.get('TIKV_PD_ENDPOINTS', '127.0.0.1:2379'))
+    parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/extenddb')
+    parser.add_argument('--no-build', action='store_true')
+    parser.add_argument('--backend', choices=['tikv', 'sqlite'], default='tikv',
+                        help='Use sqlite for a differential reference run with the same isolation')
+    parser.add_argument('--throttling', choices=['true', 'false'], default='true',
+                        help='Explicit test setting; disable only for a labeled comparison run')
+    parser.add_argument('--command', action='store_true', help='Run the argv after -- instead of pytest, with isolated test credentials and endpoints')
+    parser.add_argument('--workdir', type=Path, default=ROOT, help='Working directory for the test command')
+    parser.add_argument('--setting', type=parse_setting, action='append', default=[], metavar='KEY=VALUE')
+    parser.add_argument('--artifacts-dir', type=Path, help='Keep server.log and a run manifest after cleanup')
+    parser.add_argument('pytest_args', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    settings = dict(control_plane_delay_seconds='0.05', index_propagation_delay_ms='0',
+                    throttling_enabled=args.throttling)
+    settings.update(args.setting)
+    if args.artifacts_dir:
+        args.artifacts_dir = args.artifacts_dir.resolve()
+        args.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    tests = args.pytest_args
+    if tests[:1] == ['--']:
+        tests = tests[1:]
+    if args.command and not tests:
+        parser.error('--command requires an executable after --')
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    if not args.no_build:
+        subprocess.run(['cargo', 'build', '-p', 'extenddb', '--no-default-features', '--features', args.backend], cwd=ROOT, check=True)
+    binary = str(args.binary.resolve())
+    namespace = 'wire_test_' + uuid.uuid4().hex
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    endpoint = f'https://127.0.0.1:{port}'
+    env = test_environment(dict(os.environ), endpoint, binary, secrets.token_urlsafe(32))
+    # A temporary directory holds logs/config but never prints credentials.
+    with tempfile.TemporaryDirectory(prefix='extenddb-tikv-') as tmp:
+        # Keep the exact backend binary stable if another build runs concurrently.
+        pinned_binary = Path(tmp) / 'extenddb-tikv'
+        shutil.copy2(binary, pinned_binary)
+        binary = str(pinned_binary)
+        env['EXTENDDB_BINARY'] = binary
+        config = Path(tmp) / 'extenddb.toml'
+        logfile = Path(tmp) / 'server.log'
+        # The server canonicalizes jail roots. On macOS /var is an alias of
+        # /private/var; requests must use the same canonical spelling.
+        files = (Path(tmp) / 'files').resolve()
+        files.mkdir()
+        env['TMPDIR'] = str(files)
+        cert = str(Path.home() / '.extenddb/tls/cert.pem')
+        env.update(EXTENDDB_CA_CERT=cert, NODE_EXTRA_CA_CERTS=cert, AWS_CA_BUNDLE=cert)
+        server = None
+        initialized = False
+        try:
+            storage_args = (['--tikv-pd-endpoints', args.pd_endpoints, '--tikv-namespace', namespace]
+                            if args.backend == 'tikv' else ['--sqlite-path', str(Path(tmp) / 'reference.sqlite')])
+            subprocess.run([binary, 'init', '--backend', args.backend, *storage_args,
+                            '--config', str(config)], env=env, cwd=ROOT, check=True)
+            initialized = True
+            text = config.read_text()
+            text, count = re.subn(r'^#?\s*port = 18443[^\n]*$', f'port = {port}', text, count=1, flags=re.MULTILINE)
+            if count != 1:
+                raise RuntimeError('Generated config has no expected server port field')
+            text += f'\n[import]\npaths = [{json.dumps(str(files))}]\n\n[export]\npaths = [{json.dumps(str(files))}]\n'
+            config.write_text(text)
+            env['EXTENDDB_CONFIG'] = str(config)
+            # Match devtools/run-tests: exercise lifecycle transitions and real
+            # capacity enforcement instead of silently disabling those tests.
+            for name, value in settings.items():
+                subprocess.run([binary, 'settings', '--config', str(config), 'set', name, value],
+                               env=env, cwd=ROOT, check=True)
+            with logfile.open('w') as log:
+                server = subprocess.Popen([binary, 'serve', '--config', str(config), '--foreground'],
+                                          env=env, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+            deadline = time.monotonic() + 30
+            while True:
+                if server.poll() is not None:
+                    raise RuntimeError('Test server exited during startup')
+                try:
+                    if requests.get(endpoint + '/health', verify=False, timeout=1).ok:
+                        break
+                except requests.RequestException:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Test server did not become healthy')
+                time.sleep(0.1)
+            provision = subprocess.run([sys.executable, str(ROOT / 'devtools/provision-test-credentials')],
+                                       env=env, cwd=ROOT, text=True, capture_output=True, check=True)
+            for line in provision.stdout.splitlines():
+                if line.startswith('export '):
+                    key, value = line[7:].split('=', 1)
+                    env[key] = value
+            subprocess.run([binary, 'verify', '--config', str(config)], env=env, cwd=ROOT, check=True)
+            command = tests if args.command else [sys.executable, '-m', 'pytest', '-q', '--tb=short', *(tests or DEFAULT_SUITES)]
+            result = subprocess.run(command, env=env, cwd=args.workdir)
+            if result.returncode:
+                print(logfile.read_text()[-12000:], file=sys.stderr)
+            return result.returncode
+        except BaseException:
+            if logfile.exists():
+                print(logfile.read_text()[-12000:], file=sys.stderr)
+            raise
+        finally:
+            if server is not None and server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+            try:
+                if initialized:
+                    subprocess.run([binary, 'destroy', '--config', str(config), '--yes'], env=env, cwd=ROOT, check=True)
+            finally:
+                # A failed cleanup is especially important to diagnose; retain
+                # evidence before TemporaryDirectory removes the server log.
+                if args.artifacts_dir:
+                    if logfile.exists():
+                        shutil.copy2(logfile, args.artifacts_dir / 'server.log')
+                    (args.artifacts_dir / 'run.json').write_text(json.dumps({
+                        'backend': args.backend, 'settings': settings,
+                        'command': tests or DEFAULT_SUITES,
+                    }, indent=2) + '\n')
+
+if __name__ == '__main__':
+    raise SystemExit(main())

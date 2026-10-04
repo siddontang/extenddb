@@ -38,9 +38,10 @@ pub fn desugar_key_conditions(
     })?;
 
     if hash_cond.comparison_operator != "EQ" {
-        return Err(DynamoDbError::ValidationException(
-            "Query key condition not supported".to_owned(),
-        ));
+        return Err(DynamoDbError::ValidationException(format!(
+            "Query key condition not supported: {}",
+            hash_cond.comparison_operator
+        )));
     }
 
     if hash_cond.attribute_value_list.len() != 1 {
@@ -214,6 +215,10 @@ fn desugar_one_filter_condition(
     values: &mut HashMap<String, AttributeValue>,
     counter: &mut u32,
 ) -> Result<Expr, DynamoDbError> {
+    extenddb_core::validation::legacy::validate_legacy_comparison(
+        &cond.comparison_operator,
+        &cond.attribute_value_list,
+    )?;
     match cond.comparison_operator.as_str() {
         "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
             if cond.attribute_value_list.len() != 1 {
@@ -294,10 +299,18 @@ fn desugar_one_filter_condition(
             let placeholder = format!("_f{counter}");
             *counter += 1;
             values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
-            Ok(Expr::Not(Box::new(Expr::Function {
-                name: "contains".to_owned(),
-                args: vec![path.clone(), Expr::Placeholder(placeholder)],
-            })))
+            // Legacy NOT_CONTAINS is false when the attribute is absent,
+            // unlike the modern NOT contains(...) expression.
+            Ok(Expr::And(
+                Box::new(Expr::Function {
+                    name: "attribute_exists".into(),
+                    args: vec![path.clone()],
+                }),
+                Box::new(Expr::Not(Box::new(Expr::Function {
+                    name: "contains".to_owned(),
+                    args: vec![path.clone(), Expr::Placeholder(placeholder)],
+                }))),
+            ))
         }
         "NULL" => Ok(Expr::Function {
             name: "attribute_not_exists".to_owned(),

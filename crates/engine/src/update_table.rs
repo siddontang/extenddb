@@ -27,6 +27,9 @@ pub async fn handle_update_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    ctx.storage
+        .validate_sse_specification(body.get("SSESpecification"))
+        .map_err(crate::create_table::storage_err_to_dynamo)?;
     // Per-member enum validation precedes everything else, including the table
     // lookup, matching the measured service ordering.
     crate::validate_enum_fields(
@@ -44,6 +47,17 @@ pub async fn handle_update_table(
             },
         ],
     )?;
+
+    if let Some(spec) = body.get("StreamSpecification") {
+        crate::validate_enum_fields(
+            spec,
+            &[crate::EnumField {
+                json_name: "StreamViewType",
+                valid: &["KEYS_ONLY", "NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES"],
+                clause: crate::EnumClause::Named("streamSpecification.streamViewType"),
+            }],
+        )?;
+    }
 
     let mut input: UpdateTableInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;

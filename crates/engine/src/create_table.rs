@@ -13,6 +13,18 @@ pub async fn handle_create_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    extenddb_core::validation::tags::validate_tag_members(&body, false)?;
+    if let Some(definitions) = body.get("AttributeDefinitions").and_then(Value::as_array) {
+        for definition in definitions {
+            for member in ["AttributeName", "AttributeType"] {
+                if definition.get(member).is_none_or(Value::is_null) {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "AttributeDefinitions member {member} is required"
+                    )));
+                }
+            }
+        }
+    }
     crate::validate_enum_fields(
         &body,
         &[
@@ -28,6 +40,17 @@ pub async fn handle_create_table(
             },
         ],
     )?;
+
+    if let Some(spec) = body.get("StreamSpecification") {
+        crate::validate_enum_fields(
+            spec,
+            &[crate::EnumField {
+                json_name: "StreamViewType",
+                valid: &["KEYS_ONLY", "NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES"],
+                clause: crate::EnumClause::Named("streamSpecification.streamViewType"),
+            }],
+        )?;
+    }
 
     let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
@@ -51,6 +74,9 @@ pub async fn handle_create_table(
     input.resolve_table_throughput_mode();
 
     validate_create_table(&input, &ctx.limits)?;
+    ctx.storage
+        .validate_sse_specification(input.sse_specification.as_ref())
+        .map_err(storage_err_to_dynamo)?;
 
     // An empty SearchSchema means the same as an absent one, so it is collapsed
     // here, once, rather than in each backend. Storing the empty list would make

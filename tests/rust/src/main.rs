@@ -7,6 +7,7 @@
 //! Requires a running extenddb instance with `EXTENDDB_TEST_ENDPOINT` and credentials set.
 
 mod helpers;
+mod runtime_http;
 mod test_base;
 
 #[cfg(test)]
