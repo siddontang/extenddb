@@ -192,7 +192,7 @@ impl TikvEngine {
                 })
             })
             .await?;
-        self.complete_vector_builds().await?;
+        self.vector_build_step().await?;
         self.reap_staging().await?;
         Ok(transitions)
     }

@@ -221,7 +221,16 @@ budget can still return a conflict under sustained cross-instance contention.
 
 `vector` owns physical row keys, synchronous maintenance and snapshot search.
 `vector::score` owns f64 distance calculations and bounded top-k ranking.
-`vector::build` implements the shared `VectorIndexBuild` primitives and driver.
+`vector::validation` is a pure, snapshot-based validator for effective billing
+mode, index counts and scalar/vector attribute redefinitions on UpdateTable;
+failed validation happens before any catalog mutation.
+`vector::build` implements the shared `VectorIndexBuild` primitives and a bounded
+`vector_build_step` scheduler. Each step changes one phase or copies at most 64
+rows per index; allocation, copying and publication cannot monopolize the common
+maintenance worker. A pending online create reports the table as UPDATING until
+backfill starts. Cancellation is accepted only in backfill, concurrent creates
+are refused, and DeleteTable refuses unfinished indexes. CreateTable and restore
+never advertise ACTIVE vector indexes before the base table accepts requests.
 It persists progress per batch, serializes workers through the table document,
 and protects base-row reads against concurrent updates/deletes. This provides
 the shared lifecycle's write ordering without a deferred propagation queue.

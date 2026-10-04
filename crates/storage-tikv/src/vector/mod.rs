@@ -10,6 +10,7 @@
 //! This is exact search, not ANN: cost grows with the selected partition.
 pub mod build;
 mod score;
+pub(crate) mod validation;
 use crate::{TikvEngine, codec, kv, table::Table};
 use extenddb_core::{
     types::*,
@@ -30,6 +31,9 @@ pub struct VectorIndex {
     pub cursor: Vec<u8>,
     pub complete: bool,
     pub skipped: usize,
+    /// Earliest allocation transition, using the configured control-plane delay.
+    #[serde(default)]
+    pub allocate_after: i64,
 }
 impl VectorIndex {
     pub fn new(mut spec: VectorIndexSpecification, building: bool) -> Result<Self, StorageError> {
@@ -46,6 +50,7 @@ impl VectorIndex {
             cursor: vec![],
             complete: !building,
             skipped: 0,
+            allocate_after: 0,
         })
     }
     pub fn meta(&self) -> VectorIndexMeta {

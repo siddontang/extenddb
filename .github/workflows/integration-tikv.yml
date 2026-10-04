@@ -51,7 +51,9 @@ jobs:
             tests/test_auth_integration.py tests/test_auth_permissions.py \
             tests/test_abac.py tests/test_metrics.py \
             tests/test_vector_search.py tests/test_vector_index_query_scan.py \
-            tests/test_tikv_backup.py tests/test_tikv_pitr.py
+            tests/test_tikv_backup.py tests/test_tikv_pitr.py \
+            tests/test_batch_write_validation_atomicity.py tests/test_control_plane_validation.py \
+            tests/test_expression_validation_contract.py tests/test_transaction_validation_atomicity.py
       - name: TiKV logs
         if: failure()
         run: |

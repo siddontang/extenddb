@@ -105,9 +105,25 @@ impl Table {
         d.vector_indexes = (!self.vectors.is_empty()).then(|| {
             self.vectors
                 .iter()
-                .map(|v| v.describe(&d.table_arn))
+                .map(|v| {
+                    let mut index = v.describe(&d.table_arn);
+                    // An index waiter must not observe ACTIVE before the base
+                    // table accepts requests, including after backup restore.
+                    if d.table_status == TableStatus::Creating {
+                        index.index_status = IndexStatus::Creating;
+                    }
+                    index
+                })
                 .collect()
         });
+        // Allocation changes the advertised control-plane state; item access
+        // remains valid. Derive it from the persisted phase instead of keeping
+        // a second state flag that can disagree with the vector build.
+        if d.table_status == TableStatus::Active
+            && self.vectors.iter().any(|v| v.backfilling == Some(false))
+        {
+            d.table_status = TableStatus::Updating;
+        }
         d.global_secondary_indexes = (!gsis.is_empty()).then_some(gsis);
         d.local_secondary_indexes = (!lsis.is_empty()).then_some(lsis);
         // Provisioned mode stays in the internal catalog, but DynamoDB omits
@@ -417,9 +433,11 @@ impl TableEngine for TikvEngine {
                     if t.description.deletion_protection_enabled {
                         return Err(StorageError::DeletionProtected(n));
                     }
-                    if t.indexes.iter().any(|i| i.cursor.is_some()) {
+                    if t.indexes.iter().any(|i| i.cursor.is_some())
+                        || t.vectors.iter().any(|v| v.backfilling.is_some())
+                    {
                         return Err(StorageError::IndexesInUse(
-                            "Index backfill in progress".into(),
+                            "Attempt to change a resource which is still in use: Cannot delete table while indexes are being created, updated, or deleted.".into(),
                         ));
                     }
                     t.description.table_status = TableStatus::Deleting;
@@ -495,9 +513,20 @@ impl TableEngine for TikvEngine {
                     if t.description.table_status != TableStatus::Active {
                         return Err(StorageError::TableNotActive(input.table_name));
                     }
+                    crate::vector::validation::update(crate::vector::validation::Current {
+                        billing: t.description.billing_mode_summary.as_ref().map_or(BillingMode::Provisioned, |s| s.billing_mode),
+                        keys: &t.description.key_schema,
+                        attributes: &t.description.attribute_definitions,
+                        indexes: &t.vectors,
+                    }, &input)?;
                     validate_billing_update(&t.description, &input)?;
                     for update in input.vector_index_updates.unwrap_or_default() {
                         if let Some(spec) = update.create {
+                            if t.vectors.iter().any(|v| v.backfilling.is_some()) {
+                                return Err(StorageError::LimitExceeded(
+                                    "Subscriber limit exceeded: Only 1 online index can be created or deleted simultaneously per table".into(),
+                                ));
+                            }
                             if t.vectors
                                 .iter()
                                 .any(|v| v.spec.index_name == spec.index_name)
@@ -505,7 +534,9 @@ impl TableEngine for TikvEngine {
                             {
                                 return Err(StorageError::IndexAlreadyExists(spec.index_name));
                             }
-                            t.vectors.push(crate::vector::VectorIndex::new(spec, true)?);
+                            let mut index = crate::vector::VectorIndex::new(spec, true)?;
+                            index.allocate_after = e.clock.now_ms() + e.control_plane_delay_ms(tx).await?;
+                            t.vectors.push(index);
                         }
                         if let Some(delete) = update.delete {
                             let pos = t
@@ -517,7 +548,7 @@ impl TableEngine for TikvEngine {
                                 })?;
                             if t.vectors[pos].backfilling == Some(false) {
                                 return Err(StorageError::IndexesInUse(
-                                    "Cannot delete vector index before backfill starts".into(),
+                                    vector_index_delete_in_allocation_phase(&t.description.table_name, &delete.index_name),
                                 ));
                             }
                             let removed = t.vectors.remove(pos);

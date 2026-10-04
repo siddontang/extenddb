@@ -7,7 +7,7 @@ mod common;
 use extenddb_core::{expression::ExpressionMaps, types::*};
 use extenddb_storage::{
     BackupEngine, DataEngine, TableEngine, VectorSearch, VectorSearchEngine,
-    management_store::ManagementStore,
+    management_store::{ManagementStore, SettingsStore},
     vector_lifecycle::{VectorIndexBuild, run_backfill},
 };
 use extenddb_storage_tikv::{
@@ -153,4 +153,149 @@ async fn memory_vectors() {
 #[ignore = "requires TiKV/PD and TIKV_PD_ENDPOINTS"]
 async fn real_vectors() {
     common::real_contract(contract).await;
+}
+
+/// Time and worker progress are independent: tests can observe and cancel each
+/// persisted phase without sleeping or racing a detached background task.
+async fn lifecycle_contract(e: TikvEngine) {
+    use extenddb_storage::error::StorageError;
+    use extenddb_storage_tikv::engine::Clock;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    struct TestClock(AtomicI64);
+    impl Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let clock = Arc::new(TestClock(AtomicI64::new(1_000)));
+    let e = e.with_clock(clock.clone());
+    let catalog = TikvCatalog::new(e.clone());
+    catalog.create_account(ACCOUNT, "phases").await.unwrap();
+    catalog
+        .set_setting("control_plane_delay_seconds", "1")
+        .await
+        .unwrap();
+    let table = e.create_table(ACCOUNT, serde_json::from_value(serde_json::json!({
+        "TableName":"phases", "BillingMode":"PAY_PER_REQUEST",
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+            {"AttributeName":"group","AttributeType":"S"}, {"AttributeName":"color","AttributeType":"S"}],
+        "VectorIndexes":[spec("initial")]
+    })).unwrap()).await.unwrap();
+    assert_eq!(table.table_status, TableStatus::Creating);
+    assert_eq!(
+        table.vector_indexes.as_ref().unwrap()[0].index_status,
+        IndexStatus::Creating
+    );
+    assert_eq!(table.vector_indexes.as_ref().unwrap()[0].backfilling, None);
+    assert!(e.table_key_info(ACCOUNT, "phases").await.is_err());
+    clock.0.fetch_add(1_000, Ordering::SeqCst);
+    e.lifecycle_step().await.unwrap();
+    let info = e.table_key_info(ACCOUNT, "phases").await.unwrap();
+    let maps = ExpressionMaps::default();
+    for i in 0..130 {
+        e.put_item(&info, item(i), false, None, &maps, None)
+            .await
+            .unwrap();
+    }
+    let create = || {
+        serde_json::from_value(serde_json::json!({
+            "TableName":"phases", "VectorIndexUpdates":[{"Create":spec("online")}]
+        }))
+        .unwrap()
+    };
+    let delete = || {
+        serde_json::from_value(serde_json::json!({
+            "TableName":"phases", "VectorIndexUpdates":[{"Delete":{"IndexName":"online"}}]
+        }))
+        .unwrap()
+    };
+    let describe = || DescribeTableInput {
+        table_name: "phases".into(),
+    };
+    let d = e.update_table(ACCOUNT, create()).await.unwrap();
+    assert_eq!(d.table_status, TableStatus::Updating);
+    assert_eq!(d.vector_indexes.unwrap()[1].backfilling, Some(false));
+    assert!(
+        matches!(e.update_table(ACCOUNT, delete()).await, Err(StorageError::IndexesInUse(m))
+        if m == vector_index_delete_in_allocation_phase("phases", "online"))
+    );
+    let sibling = serde_json::from_value(serde_json::json!({
+        "TableName":"phases", "VectorIndexUpdates":[{"Create":spec("sibling")}]
+    }))
+    .unwrap();
+    assert!(matches!(
+        e.update_table(ACCOUNT, sibling).await,
+        Err(StorageError::LimitExceeded(_))
+    ));
+    assert!(matches!(
+        e.delete_table(
+            ACCOUNT,
+            DeleteTableInput {
+                table_name: "phases".into()
+            }
+        )
+        .await,
+        Err(StorageError::IndexesInUse(_))
+    ));
+    // Advancing a worker without advancing time must preserve allocation.
+    e.lifecycle_step().await.unwrap();
+    assert_eq!(
+        e.describe_table(ACCOUNT, describe())
+            .await
+            .unwrap()
+            .table_status,
+        TableStatus::Updating
+    );
+    clock.0.fetch_add(1_000, Ordering::SeqCst);
+    e.lifecycle_step().await.unwrap();
+    let d = e.describe_table(ACCOUNT, describe()).await.unwrap();
+    assert_eq!(d.table_status, TableStatus::Active);
+    assert_eq!(d.vector_indexes.unwrap()[1].backfilling, Some(true));
+    assert!(search(&e, &info, "online").await.is_err());
+    // Cancellation is accepted in backfill; the old worker cannot publish it.
+    let mut retired = Build::load(e.clone(), ACCOUNT, "phases", "online")
+        .await
+        .unwrap();
+    e.update_table(ACCOUNT, delete()).await.unwrap();
+    e.update_table(ACCOUNT, create()).await.unwrap();
+    assert!(retired.mark_active(0).await.is_err());
+    clock.0.fetch_add(1_000, Ordering::SeqCst);
+    e.lifecycle_step().await.unwrap();
+    // Three bounded batches for 130 rows. Even the final batch does not publish
+    // ACTIVE until the following step, keeping the phase boundary explicit.
+    for _ in 0..3 {
+        e.lifecycle_step().await.unwrap();
+        let d = e.describe_table(ACCOUNT, describe()).await.unwrap();
+        assert_eq!(
+            d.vector_indexes.unwrap()[1].index_status,
+            IndexStatus::Creating
+        );
+    }
+    e.lifecycle_step().await.unwrap();
+    let d = e.describe_table(ACCOUNT, describe()).await.unwrap();
+    assert_eq!(
+        d.vector_indexes.unwrap()[1].index_status,
+        IndexStatus::Active
+    );
+    assert_eq!(search(&e, &info, "online").await.unwrap().hits.len(), 3);
+}
+
+#[tokio::test]
+async fn memory_vector_lifecycle() {
+    lifecycle_contract(
+        TikvEngine::new(
+            Arc::new(MemoryStore::default()),
+            "vector_phases",
+            "us-east-1",
+        )
+        .unwrap(),
+    )
+    .await;
+}
+#[cfg(feature = "client")]
+#[tokio::test]
+#[ignore = "requires TiKV/PD and TIKV_PD_ENDPOINTS"]
+async fn real_vector_lifecycle() {
+    common::real_contract(lifecycle_contract).await;
 }

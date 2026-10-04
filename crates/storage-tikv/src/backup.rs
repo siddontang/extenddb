@@ -151,7 +151,12 @@ impl BackupEngine for TikvEngine {
                     }
                 }
                 let details = BackupDetails {
-                    backup_arn: format!("{}/backup/{}", reader.table.description.table_arn, id),
+                    backup_arn: format!(
+                        "{}/backup/{:017}-{:08x}",
+                        reader.table.description.table_arn,
+                        e.clock.now_ms(),
+                        rand::random::<u32>()
+                    ),
                     backup_name: b,
                     backup_status: "AVAILABLE".into(),
                     backup_type: "USER".into(),
@@ -177,6 +182,14 @@ impl BackupEngine for TikvEngine {
                             kv::get::<crate::catalog::Account>(tx, e.key(&["account", &a])).await?;
                         if owner.is_none_or(|o| o.generation != backup.account_generation) {
                             return Err(missing());
+                        }
+                        if kv::get::<Backup>(tx, e.key(&["backup", &a, &backup.details.backup_arn]))
+                            .await?
+                            .is_some()
+                        {
+                            return Err(StorageError::Validation(
+                                "Backup identifier collision; retry backup".into(),
+                            ));
                         }
                         stage.publish(tx).await?;
                         kv::put(

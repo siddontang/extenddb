@@ -10,9 +10,7 @@
 use crate::{TikvEngine, kv, table::Table, vector};
 use extenddb_storage::{
     error::StorageError,
-    vector_lifecycle::{
-        BackfillRow, BatchOutcome, VectorIndexBuild, classify_backfill_row, run_backfill,
-    },
+    vector_lifecycle::{BackfillRow, BatchOutcome, VectorIndexBuild, classify_backfill_row},
 };
 
 #[derive(Clone)]
@@ -218,9 +216,11 @@ impl VectorIndexBuild for Build {
     fn notify_active(&mut self) {} // live writes already maintain the index atomically
 }
 impl TikvEngine {
-    /// Resume every unfinished build using the shared lifecycle driver. Each
-    /// transaction is at most 64 rows; source reads and progress commit together.
-    pub async fn complete_vector_builds(&self) -> Result<(), StorageError> {
+    /// Advance each unfinished index by one persisted phase or bounded batch.
+    /// Allocation, backfill, and publication occur on separate worker steps, so
+    /// cancellation remains possible and large builds do not monopolize TTL or
+    /// table maintenance. Explicit Build primitives remain usable in fault tests.
+    pub async fn vector_build_step(&self) -> Result<(), StorageError> {
         let tables = self
             .db
             .run(|tx| {
@@ -234,10 +234,16 @@ impl TikvEngine {
             }
             for v in t.vectors.into_iter().filter(|v| v.backfilling.is_some()) {
                 let mut build = Build::new(self.clone(), t.description.table_id.clone(), v.id);
-                build.set_backfilling().await?;
-                let result = run_backfill(&mut build, 64, std::time::Duration::ZERO).await?;
-                build.mark_active(result.skipped).await?;
-                build.notify_active();
+                if v.backfilling == Some(false) {
+                    if self.clock.now_ms() >= v.allocate_after {
+                        build.set_backfilling().await?;
+                    }
+                } else if v.complete {
+                    build.mark_active(v.skipped).await?;
+                    build.notify_active();
+                } else {
+                    build.backfill_batch(None, 64).await?;
+                }
             }
         }
         Ok(())
