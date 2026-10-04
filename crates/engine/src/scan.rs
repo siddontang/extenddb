@@ -67,6 +67,9 @@ pub async fn handle_scan(
         ],
     )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    extenddb_core::validation::legacy::validate_attributes_to_get(
+        input.attributes_to_get.as_deref(),
+    )?;
 
     // Validate Filter/Projection expressions before the existence
     // check; index resolution, Segment/Limit/Select and key checks stay after.

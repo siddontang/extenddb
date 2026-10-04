@@ -43,5 +43,23 @@ pub async fn handle_delete_table(
     let output = DeleteTableOutput {
         table_description: table_desc,
     };
-    serialize_output(&output)
+    let mut output = serialize_output(&output)?;
+    // DeleteTable returns a deletion summary rather than the full schema from
+    // DescribeTable. Keep this wire projection in the engine: backends still
+    // return their complete catalog image for invalidation and internal callers.
+    if let Some(description) = output
+        .get_mut("TableDescription")
+        .and_then(Value::as_object_mut)
+    {
+        for field in [
+            "CreationDateTime",
+            "KeySchema",
+            "AttributeDefinitions",
+            "GlobalSecondaryIndexes",
+            "LocalSecondaryIndexes",
+        ] {
+            description.remove(field);
+        }
+    }
+    Ok(output)
 }

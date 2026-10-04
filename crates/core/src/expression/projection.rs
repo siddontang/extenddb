@@ -556,7 +556,9 @@ mod tests {
 
     #[test]
     fn compile_without_overlap_rejection_accepts_duplicates() {
-        // Desugared AttributesToGet keeps the legacy accept-duplicates behavior.
+        // Trie merging can be used without expression overlap rejection. The
+        // AttributesToGet request validator rejects duplicate literal names
+        // separately, before this compilation step.
         let tokens = tokenize("a, a").unwrap();
         let paths = parse_projection(&tokens).unwrap();
         let maps = ExpressionMaps::new(HashMap::new(), HashMap::new());

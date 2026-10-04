@@ -1,11 +1,27 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Validate legacy Expected/QueryFilter/ScanFilter operands before desugaring.
+//! Validate legacy read projections and condition operands before desugaring.
 //! Legacy IN and CONTAINS accept a narrower set of constants than expressions;
 //! keeping this boundary here avoids changing the modern evaluator's semantics.
 use crate::{error::DynamoDbError, types::AttributeValue};
 use std::cmp::Ordering;
+
+/// Legacy projection members are literal attribute names, not document paths.
+/// Check duplicates before compiling the projection or fetching data, including
+/// when no requested item exists. Keep this separate from expression overlap
+/// validation: `a` and `a.b` are distinct literal names in AttributesToGet.
+pub fn validate_attributes_to_get(names: Option<&[String]>) -> Result<(), DynamoDbError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names.unwrap_or_default() {
+        if !seen.insert(name) {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: Duplicate value in attribute name: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Check operator spelling, arity and constant types without reading an item.
 pub fn validate_legacy_comparison(
@@ -75,6 +91,17 @@ pub fn validate_legacy_comparison(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_projection_rejects_duplicates_but_preserves_literal_names() {
+        let names = ["a", "a.b", "a[0]", "名字"].map(str::to_owned);
+        assert!(validate_attributes_to_get(Some(&names)).is_ok());
+        assert!(validate_attributes_to_get(None).is_ok());
+        for duplicate in ["a", "名字"] {
+            let names = [duplicate, "unrelated", duplicate].map(str::to_owned);
+            assert!(matches!(validate_attributes_to_get(Some(&names)),
+                Err(DynamoDbError::ValidationException(message)) if message.ends_with(duplicate)));
+        }
+    }
     #[test]
     fn arity_and_constant_types_are_checked_without_rows() {
         use AttributeValue::*;

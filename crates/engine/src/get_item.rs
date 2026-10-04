@@ -35,6 +35,9 @@ pub async fn handle_get_item(
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     let input: GetItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    extenddb_core::validation::legacy::validate_attributes_to_get(
+        input.attributes_to_get.as_deref(),
+    )?;
 
     // Validate the projection (and EAN usage) before the existence
     // check, so a missing table returns ValidationException, not

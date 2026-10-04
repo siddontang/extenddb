@@ -70,6 +70,9 @@ pub async fn handle_query(
         }],
     )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    extenddb_core::validation::legacy::validate_attributes_to_get(
+        input.attributes_to_get.as_deref(),
+    )?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx
