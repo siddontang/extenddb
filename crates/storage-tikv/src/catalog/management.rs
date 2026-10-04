@@ -14,6 +14,7 @@ impl ManagementStore for TikvCatalog {
         Box::pin(async move {
             let e = self.engine.clone();
             let now = self.now();
+            let _admission = e.admit_account_write(&account_id).await;
             e.db.clone()
                 .run(move |tx| {
                     let e = e.clone();
@@ -40,6 +41,7 @@ impl ManagementStore for TikvCatalog {
         let account_id = account_id.to_owned();
         Box::pin(async move {
             let e = self.engine.clone();
+            let _admission = e.admit_account_write(&account_id).await;
             e.db.clone()
                 .run(move |tx| {
                     let e = e.clone();

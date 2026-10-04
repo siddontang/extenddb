@@ -38,6 +38,17 @@ pub struct TikvEngine {
     pub(crate) write_gates: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
 }
 impl TikvEngine {
+    /// Admit catalog publication before opening its snapshot. Protected account
+    /// reads become lock-only writes in TiKV, so even independent table/backup
+    /// publications for one account contend. This uses the same bounded, fair
+    /// gates as item writes; distributed correctness still relies on KV guards.
+    pub(crate) async fn admit_account_write(
+        &self,
+        account: &str,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        self.admit_writes([self.key(&["account", account])]).await
+    }
+
     /// Construct with an injected store. Connection/auth/bootstrap are separate.
     pub fn new(
         store: Arc<dyn Store>,
@@ -107,6 +118,24 @@ impl TikvEngine {
                 extenddb_storage::error::StorageError::Internal(
                     "Invalid setting control_plane_delay_seconds".into(),
                 )
+            })
+    }
+
+    /// Read a millisecond delay without permitting negative or overflowing
+    /// deadlines. The management API validates settings too, but catalog users
+    /// and migrated state can bypass that API.
+    pub(crate) async fn delay_deadline(
+        &self,
+        tx: &mut dyn crate::kv::Transaction,
+        name: &str,
+        default: u64,
+    ) -> Result<i64, extenddb_storage::error::StorageError> {
+        let delay = self.setting(tx, name, default).await?;
+        i64::try_from(delay)
+            .ok()
+            .and_then(|delay| self.clock.now_ms().checked_add(delay))
+            .ok_or_else(|| {
+                extenddb_storage::error::StorageError::Internal(format!("Invalid setting {name}"))
             })
     }
 }

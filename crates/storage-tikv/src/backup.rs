@@ -172,6 +172,7 @@ impl BackupEngine for TikvEngine {
                     chunks: 0,
                     item_count: count,
                 };
+                let _admission = e.admit_account_write(&a).await;
                 e.db.run(|tx| {
                     let e = e.clone();
                     let a = a.clone();

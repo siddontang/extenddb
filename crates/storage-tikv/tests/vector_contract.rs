@@ -299,3 +299,133 @@ async fn memory_vector_lifecycle() {
 async fn real_vector_lifecycle() {
     common::real_contract(lifecycle_contract).await;
 }
+
+/// Timing is persisted, not a sleeping worker or an in-process timer. Competing
+/// workers and freshly loaded Build handles must observe the same deadlines.
+async fn delayed_lifecycle_contract(e: TikvEngine) {
+    use extenddb_storage_tikv::engine::Clock;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    struct TestClock(AtomicI64);
+    impl Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let clock = Arc::new(TestClock(AtomicI64::new(10_000)));
+    let e = e.with_clock(clock.clone());
+    let catalog = TikvCatalog::new(e.clone());
+    catalog.create_account(ACCOUNT, "delays").await.unwrap();
+    for (key, value) in [
+        ("vector_allocation_phase_delay_ms", "100"),
+        ("vector_backfill_batch_delay_ms", "200"),
+        ("vector_index_min_creating_ms", "1000"),
+    ] {
+        catalog.set_setting(key, value).await.unwrap();
+    }
+    e.create_table(ACCOUNT, serde_json::from_value(serde_json::json!({
+        "TableName":"delays", "BillingMode":"PAY_PER_REQUEST",
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+            {"AttributeName":"group","AttributeType":"S"}, {"AttributeName":"color","AttributeType":"S"}],
+        "VectorIndexes":[spec("initial")]
+    })).unwrap()).await.unwrap();
+    let info = e.table_key_info(ACCOUNT, "delays").await.unwrap();
+    for i in 0..130 {
+        e.put_item(
+            &info,
+            item(i),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let create = || {
+        serde_json::from_value(serde_json::json!({
+            "TableName":"delays", "VectorIndexUpdates":[{"Create":spec("delayed")}]
+        }))
+        .unwrap()
+    };
+    // Invalid direct catalog settings fail before publishing any new index.
+    for invalid in ["-1", "18446744073709551615", "broken"] {
+        catalog
+            .set_setting("vector_allocation_phase_delay_ms", invalid)
+            .await
+            .unwrap();
+        assert!(e.update_table(ACCOUNT, create()).await.is_err());
+    }
+    catalog
+        .set_setting("vector_allocation_phase_delay_ms", "100")
+        .await
+        .unwrap();
+    e.update_table(ACCOUNT, create()).await.unwrap();
+    let describe = || {
+        e.describe_table(
+            ACCOUNT,
+            DescribeTableInput {
+                table_name: "delays".into(),
+            },
+        )
+    };
+    clock.0.store(10_099, Ordering::SeqCst);
+    e.vector_build_step().await.unwrap();
+    assert_eq!(
+        describe().await.unwrap().vector_indexes.unwrap()[1].backfilling,
+        Some(false)
+    );
+    clock.0.store(10_100, Ordering::SeqCst);
+    e.vector_build_step().await.unwrap();
+    assert_eq!(
+        describe().await.unwrap().vector_indexes.unwrap()[1].backfilling,
+        Some(true)
+    );
+    let (a, b) = tokio::join!(e.vector_build_step(), e.vector_build_step());
+    a.unwrap();
+    b.unwrap();
+    // At most one batch can consume this timestamp; three batches are needed.
+    clock.0.store(10_299, Ordering::SeqCst);
+    e.vector_build_step().await.unwrap();
+    clock.0.store(10_300, Ordering::SeqCst);
+    e.vector_build_step().await.unwrap();
+    assert!(
+        Build::load(e.clone(), ACCOUNT, "delays", "delayed")
+            .await
+            .unwrap()
+            .mark_active(0)
+            .await
+            .is_err()
+    );
+    clock.0.store(10_500, Ordering::SeqCst);
+    e.vector_build_step().await.unwrap();
+    clock.0.store(10_999, Ordering::SeqCst);
+    e.vector_build_step().await.unwrap();
+    assert_eq!(
+        describe().await.unwrap().vector_indexes.unwrap()[1].backfilling,
+        Some(true)
+    );
+    assert!(search(&e, &info, "delayed").await.is_err());
+    clock.0.store(11_000, Ordering::SeqCst);
+    e.vector_build_step().await.unwrap();
+    assert_eq!(
+        describe().await.unwrap().vector_indexes.unwrap()[1].index_status,
+        IndexStatus::Active
+    );
+    assert_eq!(search(&e, &info, "delayed").await.unwrap().hits.len(), 3);
+}
+
+#[tokio::test]
+async fn memory_vector_delays() {
+    delayed_lifecycle_contract(
+        TikvEngine::new(Arc::new(MemoryStore::default()), "delays", "us-east-1").unwrap(),
+    )
+    .await;
+}
+
+#[cfg(feature = "client")]
+#[tokio::test]
+#[ignore = "requires TiKV/PD and TIKV_PD_ENDPOINTS"]
+async fn real_vector_delays() {
+    common::real_contract(delayed_lifecycle_contract).await;
+}

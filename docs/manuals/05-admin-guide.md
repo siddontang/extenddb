@@ -178,6 +178,13 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
 | `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building. The pause is outside the batch transaction, so writes are still accepted throughout, but it does extend the per-table propagation hold: no index on that table advances while the build runs, GSIs included, and the accepted range goes up to 60 s per batch. |
 | `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Without it the phase lasts only from the `UpdateTable` transaction, which inserts the row as `CREATING` with `Backfilling: false`, until the detached build task flips the flag, which is a window no client can time reliably rather than one that cannot exist. |
+| `vector_index_min_creating_ms` | `1000` | Minimum duration of the online vector index's CREATING state; 0 disables the floor. Accepted range: 0–60000 ms. It never publishes an unfinished backfill. A longer floor makes lifecycle observations reproducible with slow client polling. |
+
+TiKV persists allocation, inter-batch and publication deadlines instead of
+sleeping in its maintenance worker. Its base and index writes remain synchronous
+during backfill, so the propagation hold described above for the SQL backends
+does not apply to TiKV. Changing allocation or minimum-creating settings affects
+new builds; the batch delay is read at each batch commit.
 
 ```bash
 # View current settings

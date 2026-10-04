@@ -251,6 +251,7 @@ impl TikvCatalog {
         f: impl Fn(&mut Account) -> OpResult<R> + Send + Sync + 'static,
     ) -> OpResult<R> {
         let e = self.engine.clone();
+        let _admission = e.admit_account_write(id).await;
         let id = id.to_owned();
         let f = Arc::new(f);
         e.db.clone()

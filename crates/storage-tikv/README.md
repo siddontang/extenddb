@@ -33,6 +33,16 @@ must never send messages, alter local state, or otherwise perform external side
 effects. Rollback runs on errors; the real adapter also schedules cleanup when
 a request is cancelled. Process-crash cleanup still depends on TiKV lock expiry.
 
+Catalog publication, IAM edits and table maintenance acquire a fair account
+admission gate before opening a transaction. TiKV turns their protected account
+reads into lock-only writes, which otherwise collide even when table names are
+different. Bulk backup/restore copying runs outside this gate; only publication
+holds it. Admission is local to an engine and reuses the bounded item-write
+gates. KV account-generation and table-count guards still arbitrate other server
+processes. Unknown commits are never replayed merely because admission is held.
+The mixed publication contract races creation, backup, restore and reclamation,
+then checks that the empty account can be deleted.
+
 The first transport uses optimistic two-phase commit, with read keys explicitly
 protected. Its abstraction follows the `TikvTransactionSource` / driver split in
 the user's TiDB Rust reference at commit
@@ -237,6 +247,23 @@ the shared lifecycle's write ordering without a deferred propagation queue.
 CreateTable indexes start active; UpdateTable indexes progress from CREATING
 through backfilling to ACTIVE. A failed batch leaves the index unpublished and
 a restarted worker resumes its cursor. Dropped generations cannot be revived.
+
+Online builds honor `vector_allocation_phase_delay_ms` (default 0),
+`vector_backfill_batch_delay_ms` (default 0), and
+`vector_index_min_creating_ms` (default 1000). Allocation lasts at least the
+larger of the allocation setting and `control_plane_delay_seconds`; the minimum
+creating duration starts when UpdateTable publishes the new index. Allocation
+and publication deadlines are captured on creation. The inter-batch setting is
+read for each committed batch and applies before the next batch, not after the
+final batch. Deadlines are stored with the cursor, so restart preserves them.
+The scheduler checks the current phase and deadline inside the same transaction
+that advances it; competing workers cannot skip a delay using a stale catalog
+image. It never sleeps while holding a transaction or stalls other maintenance
+work. These settings make slow lifecycle observations reproducible without
+changing production defaults. Clock-injected tests cover exact deadlines,
+concurrent workers, malformed settings, bounded batches and ready publication
+against both memory and real TiKV. Low-level `Build` primitives deliberately
+remain directly callable for fault tests and recovery orchestration.
 
 All three distance functions, HASH partitions, inline equality filters and
 projection use the existing engine contracts. Search scans 64 rows at a time

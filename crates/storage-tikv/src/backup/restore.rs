@@ -112,6 +112,7 @@ impl Writer {
         Ok(())
     }
     pub async fn finish(&self) -> Result<TableDescription, StorageError> {
+        let _admission = self.e.admit_account_write(&self.table.account).await;
         self.e
             .db
             .run(|tx| {

@@ -76,6 +76,7 @@ impl TikvEngine {
             };
             let id = table.description.table_id;
             for _ in 0..batches {
+                let _admission = self.admit_account_write(&table.account).await;
                 let result = self
                     .db
                     .run(|tx| {

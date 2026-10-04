@@ -238,6 +238,7 @@ impl TableEngine for TikvEngine {
         let (engine, account) = (self.clone(), account.to_owned());
         Box::pin(async move {
             engine.validate_sse_specification(input.sse_specification.as_ref())?;
+            let _admission = engine.admit_account_write(&account).await;
             engine
                 .db
                 .run(|tx| {
@@ -536,6 +537,10 @@ impl TableEngine for TikvEngine {
                             }
                             let mut index = crate::vector::VectorIndex::new(spec, true)?;
                             index.allocate_after = e.clock.now_ms() + e.control_plane_delay_ms(tx).await?;
+                            index.allocate_after = index.allocate_after.max(e.delay_deadline(tx,
+                                extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS, 0).await?);
+                            index.activate_after = e.delay_deadline(tx,
+                                extenddb_core::settings_keys::VECTOR_INDEX_MIN_CREATING_MS, 1_000).await?;
                             t.vectors.push(index);
                         }
                         if let Some(delete) = update.delete {

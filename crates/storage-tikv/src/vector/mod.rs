@@ -34,6 +34,11 @@ pub struct VectorIndex {
     /// Earliest allocation transition, using the configured control-plane delay.
     #[serde(default)]
     pub allocate_after: i64,
+    /// Persisted deadlines let any worker resume a delayed build after restart.
+    #[serde(default)]
+    pub activate_after: i64,
+    #[serde(default)]
+    pub next_batch_after: i64,
 }
 impl VectorIndex {
     pub fn new(mut spec: VectorIndexSpecification, building: bool) -> Result<Self, StorageError> {
@@ -51,6 +56,8 @@ impl VectorIndex {
             complete: !building,
             skipped: 0,
             allocate_after: 0,
+            activate_after: 0,
+            next_batch_after: 0,
         })
     }
     pub fn meta(&self) -> VectorIndexMeta {
