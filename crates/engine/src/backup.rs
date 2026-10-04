@@ -235,7 +235,20 @@ pub(crate) async fn handle_update_continuous_backups(
         .get("PointInTimeRecoverySpecification")
         .and_then(|v| v.get("PointInTimeRecoveryEnabled"))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .ok_or_else(|| {
+            DynamoDbError::ValidationException(
+                "PointInTimeRecoveryEnabled must be a boolean".into(),
+            )
+        })?;
+    if let Some(period) = body
+        .get("PointInTimeRecoverySpecification")
+        .and_then(|v| v.get("RecoveryPeriodInDays"))
+        && period.as_u64() != Some(35)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "This deployment supports a recovery period of 35 days".into(),
+        ));
+    }
 
     let desc = ctx
         .storage
@@ -246,23 +259,73 @@ pub(crate) async fn handle_update_continuous_backups(
     serialize_output(&json!({ "ContinuousBackupsDescription": desc }))
 }
 
-/// Handle `RestoreTableToPointInTime`.
-///
-/// Point-in-time recovery is not yet implemented. The previous implementation
-/// faked a restore by snapshotting the current table state (ignoring
-/// `RestoreDateTime`), which violates tenet 1 (fidelity over features).
-/// Until real PITR is implemented, return an error.
+/// Parse recovery time separately from I/O so malformed requests cannot reach a
+/// storage implementation or accidentally become a latest-state restore.
+fn recovery_point(body: &Value) -> Result<extenddb_storage::RestorePoint, DynamoDbError> {
+    let invalid = || {
+        DynamoDbError::ValidationException(
+            "Specify either RestoreDateTime or UseLatestRestorableTime=true".into(),
+        )
+    };
+    let latest = match body.get("UseLatestRestorableTime") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(invalid()),
+    };
+    match (latest, body.get("RestoreDateTime")) {
+        (true, None) => Ok(extenddb_storage::RestorePoint::Latest),
+        (false, Some(v)) => v
+            .as_f64()
+            .filter(|t| t.is_finite() && *t >= 0.)
+            .map(extenddb_storage::RestorePoint::Timestamp)
+            .ok_or_else(invalid),
+        _ => Err(invalid()),
+    }
+}
+/// Restore from a backend's timestamp-aware capability. Unsupported backends
+/// keep refusing; only implementations with real historical snapshots opt in.
 pub(crate) async fn handle_restore_table_to_point_in_time(
-    _body: Value,
-    _ctx: &OperationContext,
+    body: Value,
+    ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    // TODO(fidelity): Implement real PITR using PostgreSQL temporal/history
-    // table approach — item_history table capturing every mutation, DISTINCT ON
-    // query to reconstruct state at time T, 35-day retention via background
-    // pruning.
-    Err(DynamoDbError::ValidationException(
-        "Point-in-time recovery restore is not yet supported".to_owned(),
-    ))
+    let point = recovery_point(&body)?;
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| DynamoDbError::ValidationException(format!("{name} is required")))
+    };
+    let source = field("SourceTableName")?;
+    let target = field("TargetTableName")?;
+    extenddb_core::validation::validate_table_name(target, &ctx.limits)?;
+    // Overrides require an explicit schema-remapping implementation; refusing
+    // them avoids silently changing the meaning of a requested recovery.
+    if let Some(fields) = body.as_object() {
+        for key in fields.keys() {
+            if ![
+                "SourceTableName",
+                "TargetTableName",
+                "RestoreDateTime",
+                "UseLatestRestorableTime",
+            ]
+            .contains(&key.as_str())
+            {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "{key} is not supported for point-in-time restore"
+                )));
+            }
+        }
+    }
+    let mut desc = ctx
+        .storage
+        .restore_table_at(&ctx.account_id, source, target, point)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, target)
+        .await;
+    desc.validate_vector_index_readiness()?;
+    desc.populate_table_throughput_mode_summary();
+    serialize_output(&json!({"TableDescription":desc}))
 }
 
 /// Convert storage errors to `DynamoDB` errors.
@@ -271,7 +334,8 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
         extenddb_storage::error::StorageError::TableNotFound(msg) => {
             DynamoDbError::TableNotFoundException(msg)
         }
-        extenddb_storage::error::StorageError::TableAlreadyExists(msg) => {
+        extenddb_storage::error::StorageError::TableNotActive(msg)
+        | extenddb_storage::error::StorageError::TableAlreadyExists(msg) => {
             DynamoDbError::ResourceInUseException(msg)
         }
         extenddb_storage::error::StorageError::Validation(msg) => {
@@ -301,11 +365,32 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_arn_field, storage_err_to_dynamo};
+    use super::{backup_arn_field, recovery_point, storage_err_to_dynamo};
     use extenddb_core::error::DynamoDbError;
     use extenddb_storage::error::StorageError;
     use serde_json::json;
 
+    #[test]
+    fn recovery_time_validation_is_explicit() {
+        use extenddb_storage::RestorePoint;
+        assert!(
+            matches!(recovery_point(&json!({"RestoreDateTime":123.5})).unwrap(),RestorePoint::Timestamp(t) if t==123.5)
+        );
+        assert!(matches!(
+            recovery_point(&json!({"UseLatestRestorableTime":true})).unwrap(),
+            RestorePoint::Latest
+        ));
+        for body in [
+            json!({}),
+            json!({"UseLatestRestorableTime":false}),
+            json!({"RestoreDateTime":-1}),
+            json!({"RestoreDateTime":"now"}),
+            json!({"UseLatestRestorableTime":"true"}),
+            json!({"UseLatestRestorableTime":true,"RestoreDateTime":1}),
+        ] {
+            assert!(recovery_point(&body).is_err());
+        }
+    }
     const ACCOUNT: &str = "123456789012";
 
     #[test]

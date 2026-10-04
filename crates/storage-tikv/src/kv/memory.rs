@@ -20,6 +20,7 @@ use std::{
 pub struct MemoryStore {
     inner: Arc<Mutex<State>>,
 }
+type Image = BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)>;
 #[derive(Default)]
 struct State {
     clock: u64,
@@ -27,6 +28,9 @@ struct State {
     conflicts: usize,
     unknown: usize,
     scan_writes: usize,
+    history: BTreeMap<u64, Image>,
+    barriers: BTreeMap<String, u64>,
+    gc_floor: u64,
 }
 struct Tx {
     owner: Arc<Mutex<State>>,
@@ -43,6 +47,14 @@ impl MemoryStore {
         self.inner.lock().unwrap().scan_writes
     }
 
+    /// Advance the deterministic TSO physical clock for PITR contracts.
+    pub fn advance_time(&self, millis: u64) {
+        self.inner.lock().unwrap().clock += millis << 18;
+    }
+    /// Simulate collected history (a fault test; bypasses active barriers).
+    pub fn collect_history_before(&self, ts: u64) {
+        self.inner.lock().unwrap().gc_floor = ts;
+    }
     /// Fail this many commits before applying any writes.
     pub fn inject_conflicts(&self, n: usize) {
         self.inner.lock().unwrap().conflicts = n;
@@ -53,6 +65,58 @@ impl MemoryStore {
     }
 }
 impl Store for MemoryStore {
+    fn timestamp(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async move {
+            let mut s = self.inner.lock().unwrap();
+            s.clock += 1;
+            Ok(s.clock)
+        })
+    }
+    fn gc_floor(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async move { Ok(self.inner.lock().unwrap().gc_floor) })
+    }
+    fn retain(&self, id: String, floor: u64, ttl: i64) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async move {
+            let mut s = self.inner.lock().unwrap();
+            if ttl == 0 {
+                s.barriers.remove(&id);
+            } else {
+                let floor = floor.max(s.gc_floor);
+                s.barriers
+                    .entry(id)
+                    .and_modify(|v| *v = (*v).max(floor))
+                    .or_insert(floor);
+                let clock = s.clock;
+                let data = s.data.clone();
+                s.history.entry(clock).or_insert(data);
+            }
+            Ok(s.barriers.values().copied().min().unwrap_or(s.gc_floor))
+        })
+    }
+    fn snapshot_at(&self, ts: u64) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
+        Box::pin(async move {
+            let s = self.inner.lock().unwrap();
+            if ts <= s.gc_floor || ts > s.clock {
+                return Err(Error::Transport(
+                    "Historical snapshot outside retained window".into(),
+                ));
+            }
+            let snapshot = s
+                .history
+                .range(..=ts)
+                .next_back()
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| Error::Transport("Historical snapshot unavailable".into()))?;
+            Ok(Box::new(Tx {
+                owner: self.inner.clone(),
+                scanned: false,
+                snapshot,
+                reads: BTreeSet::new(),
+                writes: BTreeMap::new(),
+                closed: false,
+            }) as Box<dyn Transaction>)
+        })
+    }
     fn begin(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
         Box::pin(async move {
             Ok(Box::new(Tx {
@@ -184,6 +248,10 @@ impl Transaction for Tx {
             }
             for (k, v) in std::mem::take(&mut self.writes) {
                 state.data.insert(k, (version, v));
+            }
+            if !state.barriers.is_empty() {
+                let data = state.data.clone();
+                state.history.insert(version, data);
             }
             self.closed = true;
             if state.unknown > 0 {

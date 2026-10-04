@@ -663,6 +663,14 @@ pub trait WorkerStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>>;
 }
 
+/// Explicit recovery point; implementations must honor the supplied time or
+/// refuse the operation. They must never silently snapshot the current state.
+#[derive(Clone, Copy, Debug)]
+pub enum RestorePoint {
+    Latest,
+    Timestamp(f64),
+}
+
 /// Backup and point-in-time recovery operations.
 pub trait BackupEngine: Send + Sync {
     /// Create a backup of a table, snapshotting all items.
@@ -729,10 +737,22 @@ pub trait BackupEngine: Send + Sync {
         pitr_enabled: bool,
     ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
 
-    /// Restore a table to a point in time.
-    // TODO(cleanup): This method is unreachable — the engine handler returns
-    // ValidationException("not yet supported") before calling storage. Remove
-    // when real PITR is implemented or during the next storage trait cleanup.
+    /// Timestamp-aware PITR capability. Existing backends refuse by default,
+    /// preserving their previous wire behavior until they implement real history.
+    fn restore_table_at(
+        &self,
+        _account: &str,
+        _source: &str,
+        _target: &str,
+        _point: RestorePoint,
+    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
+        Box::pin(async {
+            Err(StorageError::Unsupported(
+                "Point-in-time recovery restore is not supported by this storage backend".into(),
+            ))
+        })
+    }
+    /// Legacy latest-state entry point. New handlers use `restore_table_at`.
     fn restore_table_to_point_in_time(
         &self,
         account_id: &str,

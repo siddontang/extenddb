@@ -46,7 +46,7 @@ impl ManagementStore for TikvCatalog {
                     let id = account_id.clone();
                     Box::pin(async move {
                         let key = e.key(&["account", &id]);
-                        let Some(a) = kv::get::<Account>(tx, key.clone()).await? else {
+                        let Some(a) = records::load(&e, tx, &id).await? else {
                             return Ok(Err(missing("Account")));
                         };
                         let count = kv::get::<u64>(tx, e.key(&["account_tables", &id]))
@@ -62,6 +62,7 @@ impl ManagementStore for TikvCatalog {
                         }
                         kv::delete(tx, e.key(&["account_name", &a.name])).await?;
                         kv::delete(tx, key).await?;
+                        records::retire(&e, tx, &a).await?;
                         Ok(Ok(()))
                     })
                 })

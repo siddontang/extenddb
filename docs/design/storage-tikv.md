@@ -15,7 +15,7 @@ flowchart TD
     ENGINE --> DATA[Data and ordered queries]
     ENGINE --> CATALOG[IAM and operational catalog]
     ENGINE --> LIFE[Metadata and maintenance]
-    ENGINE --> BACKUP[Atomic bounded backups]
+    ENGINE --> BACKUP[Streaming snapshots and atomic publication]
     DATA --> PURE[Key codec and index projection]
     DATA --> STREAM[Transactional streams]
     LIFE --> PURE
@@ -88,13 +88,18 @@ replay checks the original request fingerprint within the ten-minute window.
 
 ## Catalog and credentials
 
-IAM is a per-account aggregate containing principals, memberships, policies,
-boundaries, tags and sessions. This keeps relationship invariants within one
-transaction. A 4 MiB encoded cap fails before any mutation is staged. This is an
-explicit scale tradeoff for IAM, not the data-plane storage layout.
+IAM uses independent principal, policy, membership, key and session records.
+A protected account header serializes management changes and deletion; the
+logical transformation and record diff commit in one transaction. The account
+has no 4 MiB aggregate cap; each physical record is bounded at 4 MiB. Management
+currently materializes the account, so its CPU/memory cost remains O(account
+size). Authentication and authorization read relevant principal and secondary
+index prefixes instead of the whole account. Schema 2 converts legacy inline
+accounts atomically on their next management edit; upgrade requires stopped
+writers and a catalog migration, with no mixed-version writing.
 
 Access-key locators map globally unique IDs to owners. Locator changes and the
-aggregate update share a transaction; duplicate IDs cannot attach the same key
+record updates share a transaction; duplicate IDs cannot attach the same key
 to two accounts. AES-256-GCM binds ciphertext to the access-key ID using AAD.
 There is no unauthenticated fallback, and cached encryption-key buffers are
 zeroized. Credential lookup reads locator and owner in one snapshot and checks
@@ -139,14 +144,53 @@ batches per table/tick; name reuse follows physical cleanup. Retention handles
 256 entries per pass and persists progress so live early keys cannot starve
 later expired entries.
 
+## Vector search
+
+Vector metadata, validation, projections and backfill use the shared vector
+lifecycle contracts. The TiKV-specific modules separate deterministic scoring,
+transactional maintenance and the resumable build driver. Search takes one MVCC
+snapshot, scans the selected partition in bounded pages and retains only TopK
+hits. It supports Euclidean distance, cosine distance and dot product, hash
+partitions, inline equality filters and the standard projections. This is exact
+search with linear partition scan cost; it does not implement ANN acceleration.
+
+Writers maintain vector rows in the same transaction as base items. Online
+builds persist a cursor with each batch of at most 64 source rows, protect those
+source reads against concurrent writes, and publish ACTIVE only at end of scan.
+Index UUIDs prevent a deleted/recreated index from inheriting a stale worker.
+Snapshot scans do not accumulate write-lock dependencies for read-only search.
+
+The vector contracts run on the reference store and real TiKV, covering paging,
+concurrent item mutation during backfill, restart, stale workers, account
+isolation and backup restoration. Raw signed HTTP tests exercise all three
+metrics through the normal server. The follow-on vector check passed all 42
+TiKV unit/contracts and 15 vector HTTP checks locally.
+
 ## Backup, deployment and validation boundaries
 
-On-demand backup takes one transactional snapshot, capped at 4 MiB encoded.
-Restore atomically publishes a fresh table generation and rebuilt indexes.
-Larger snapshots fail before any backup is published. Large-table export needs
-a pinned timestamp with coordinated GC; this implementation does not pretend
-that independent scan transactions provide a consistent snapshot. PITR and
-vector search are refused explicitly.
+On-demand backup uses a single MVCC snapshot and immutable per-item chunks,
+then publishes its manifest atomically. Restore rebuilds items/indexes under an
+unreachable UUID and publishes the name only after the final batch. Five-minute
+staging leases make failed/cancelled operations reclaimable; an expired worker
+cannot race garbage collection into repopulating a discarded prefix. Legacy
+inline backups remain readable. There is no 4 MiB total backup cap.
+
+PD service safepoint leases protect bulk snapshots against coordinated GC. The
+adapter follows TiDB BR's timestamp-minus-one registration and checks lease
+validity around each page. It never advances GC; the external GC controller must
+honor those barriers. Failed protection or a missing chunk prevents publication.
+Backups remain in the same cluster, so independent disaster recovery still needs
+cluster backups.
+
+PITR uses actual TiKV commit-time MVCC versions through an explicit
+`RestorePoint` storage capability. Per-table recovery generations install PD
+retention barriers and an independent worker renews them. Recovery streams the
+historical base snapshot through the same atomic-publication restore writer,
+using current source table/index settings. A fixed 35-day window and 24-hour
+renewal lease bound retention; after a prolonged outage, reconciliation narrows
+the window to surviving history. No current-state fallback is permitted.
+Deleted source tables, source ARNs and restore overrides remain unsupported.
+The module README documents GC coordination, cleanup and cluster-wide disk cost.
 
 The TiDB Rust reference was read at commit
 `6a5b492097d5be084a0b1106da2c7f106c518498`, including
@@ -186,3 +230,26 @@ verification for local self-signed HTTPS. The GitHub Actions workflow provisions
 its own PD/TiKV cluster and runs the same contracts and SDK paths; this validation
 record describes local execution, not a completed hosted CI run. Multi-node
 fault injection, long-running GC and production performance remain unvalidated.
+
+## Follow-on capability implementation order
+
+| Order | Capability | Relative effort and dependency |
+|---|---|---|
+| 1 | Exact vector search | Reuses shared vector validation, projection, scoring semantics and lifecycle driver; no new catalog layout |
+| 2 | IAM account-size limit removal | Normalize records, preserve the account transaction fence, migrate legacy documents and target authorization reads |
+| 3 | Backup-size limit removal | Requires one protected snapshot across batches, staged manifests, restore publication and failure cleanup |
+| 4 | PITR | Builds on protected historical reads and bulk restore, adding durable retention state, time-aware API and recovery authorization |
+
+All stages use injected store/clock boundaries and signed incremental commits.
+Follow-on local validation passed 1,254 workspace tests (4 existing ignored),
+54 TiKV unit/contracts including real-store runs, the 81-test IAM HTTP regression, the 15-test vector HTTP
+suite, and the combined seven-test PITR/backup/vector HTTP regression. These
+counts include overlapping coverage; they are not independent totals. Tests use
+a dedicated PD/TiKV 8.5.5 cluster and isolated namespaces. The PD check after
+cleanup contained only the standard GC worker safepoint. Multi-node failover,
+35-day soak tests and production capacity benchmarks remain outstanding.
+
+The final follow-on checks also passed strict Clippy for the TiKV crate and
+binary, workspace formatting, and a locked Rust 1.88.0 TiKV binary check. The
+combined HTTP suite includes explicit source-table restore denial and target-table
+write denial. Hosted CI results are not claimed here.

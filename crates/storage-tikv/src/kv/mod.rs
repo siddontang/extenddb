@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "client")]
+pub mod gc;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
 
@@ -48,6 +50,17 @@ pub trait Transaction: Send {
         limit: u32,
         reverse: bool,
     ) -> BoxFuture<'_, Result<Vec<Pair>, Error>>;
+    /// Read-only range scan without accumulating commit dependencies. A caller
+    /// that later writes must provide a separate fence for these observations.
+    fn scan_snapshot(
+        &mut self,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: u32,
+        reverse: bool,
+    ) -> BoxFuture<'_, Result<Vec<Pair>, Error>> {
+        self.scan(start, end, limit, reverse)
+    }
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), Error>>;
     fn delete(&mut self, key: Vec<u8>) -> BoxFuture<'_, Result<(), Error>>;
     fn commit(&mut self) -> BoxFuture<'_, Result<(), Error>>;
@@ -57,6 +70,27 @@ pub trait Transaction: Send {
 /// Long-lived store; a fresh transaction is created on each retry.
 pub trait Store: Send + Sync {
     fn begin(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>>;
+    /// Long-lived read-only snapshot, protected against concurrent MVCC GC.
+    /// Non-GC reference stores can use their normal immutable snapshot.
+    fn snapshot(&self) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
+        self.begin()
+    }
+
+    /// Current TSO (milliseconds in upper bits, 18 logical bits).
+    fn timestamp(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async { Err(Error::Transport("Historical snapshots unavailable".into())) })
+    }
+    fn snapshot_at(&self, _timestamp: u64) -> BoxFuture<'_, Result<Box<dyn Transaction>, Error>> {
+        Box::pin(async { Err(Error::Transport("Historical snapshots unavailable".into())) })
+    }
+    /// Install/renew a named retention barrier; zero TTL removes it. Returns the
+    /// minimum accepted service floor. This must never advance the GC safepoint.
+    fn retain(&self, _id: String, _floor: u64, _ttl: i64) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async { Err(Error::Transport("History retention unavailable".into())) })
+    }
+    fn gc_floor(&self) -> BoxFuture<'_, Result<u64, Error>> {
+        Box::pin(async { Err(Error::Transport("GC visibility unavailable".into())) })
+    }
 }
 
 /// Per-request transaction runner. Transport-specific retries stay in the client.
@@ -77,6 +111,29 @@ impl Database {
     pub fn with_max_attempts(mut self, attempts: usize) -> Self {
         self.max_attempts = attempts.max(1);
         self
+    }
+
+    /// Open one owned read-only snapshot for a streaming operation. Unlike `run`,
+    /// this never retries with a newer timestamp; callers must not stage writes
+    /// in this transaction. Dropping the real adapter rolls it back.
+    pub async fn snapshot(&self) -> Result<Box<dyn Transaction>, StorageError> {
+        self.store.snapshot().await.map_err(storage_error)
+    }
+
+    pub async fn timestamp(&self) -> Result<u64, StorageError> {
+        self.store.timestamp().await.map_err(storage_error)
+    }
+    pub async fn snapshot_at(&self, ts: u64) -> Result<Box<dyn Transaction>, StorageError> {
+        self.store.snapshot_at(ts).await.map_err(storage_error)
+    }
+    pub async fn retain(&self, id: String, floor: u64, ttl: i64) -> Result<u64, StorageError> {
+        self.store
+            .retain(id, floor, ttl)
+            .await
+            .map_err(storage_error)
+    }
+    pub async fn gc_floor(&self) -> Result<u64, StorageError> {
+        self.store.gc_floor().await.map_err(storage_error)
     }
 
     /// Execute a replayable unit of work and commit it atomically.

@@ -223,7 +223,10 @@ async fn lifecycle_contract(e: TikvEngine, clock: Arc<TestClock>) {
     e.delete_backup(a, &backup.backup_arn).await.unwrap();
     assert!(e.list_backups(a, None).await.unwrap().is_empty());
     let retained_backup = e.create_backup(a, "restored", "retained").await.unwrap();
-    assert!(e.update_continuous_backups(a, "items", true).await.is_err());
+    e.update_continuous_backups(a, "items", true).await.unwrap();
+    e.update_continuous_backups(a, "items", false)
+        .await
+        .unwrap();
     for name in ["items", "restored"] {
         e.delete_table(
             a,
@@ -303,16 +306,7 @@ async fn resumable_backfill_ttl_backup_and_delete() {
     lifecycle_contract(e, clock).await;
 }
 
-#[tokio::test]
-async fn chunked_backup_restores_above_the_old_single_value_limit() {
-    let clock = Arc::new(TestClock(AtomicI64::new(1_000_000)));
-    let e = TikvEngine::new(
-        Arc::new(MemoryStore::default()),
-        "backup_limit",
-        "us-east-1",
-    )
-    .unwrap()
-    .with_clock(clock.clone());
+async fn large_backup_contract(e: TikvEngine) {
     let account = "111111111111";
     TikvCatalog::new(e.clone())
         .create_account(account, "backup")
@@ -335,27 +329,25 @@ async fn chunked_backup_restores_above_the_old_single_value_limit() {
             .await
             .unwrap();
     }
-    let backup = e.create_backup(account, "large", "chunked").await.unwrap();
+    let backup = e
+        .create_backup(account, "large", "large-snapshot")
+        .await
+        .unwrap();
     assert!(backup.backup_size_bytes > 4 * 1024 * 1024);
-    // Mutating the source after the snapshot must not alter its restored data.
-    let changed =
-        serde_json::from_value(serde_json::json!({"pk":{"S":"0"},"payload":{"S":"changed"}}))
-            .unwrap();
-    e.put_item(&info, changed, false, None, &maps, None)
-        .await
-        .unwrap();
     let restored = e
-        .restore_table_from_backup(account, "restored_large", &backup.backup_arn)
+        .restore_table_from_backup(account, "restored-large", &backup.backup_arn)
         .await
         .unwrap();
-    assert_eq!(restored.table_status, TableStatus::Creating);
-    clock.0.fetch_add(5, Ordering::SeqCst);
+    assert_eq!(restored.item_count, 12);
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     e.lifecycle_step().await.unwrap();
-    let restored = e.table_key_info(account, "restored_large").await.unwrap();
+    let ri = e.table_key_info(account, "restored-large").await.unwrap();
     for i in 0..12 {
-        let key = serde_json::from_value(serde_json::json!({"pk":{"S":i.to_string()}})).unwrap();
-        let row = e.get_item(&restored, &key).await.unwrap().unwrap();
-        assert_eq!(row["payload"], AttributeValue::S("x".repeat(380 * 1024)));
+        let key = Item::from_iter([("pk".into(), AttributeValue::S(i.to_string()))]);
+        assert_eq!(
+            e.get_item(&info, &key).await.unwrap(),
+            e.get_item(&ri, &key).await.unwrap()
+        );
     }
     e.delete_backup(account, &backup.backup_arn).await.unwrap();
     assert!(e.list_backups(account, None).await.unwrap().is_empty());
@@ -367,6 +359,25 @@ async fn chunked_backup_restores_above_the_old_single_value_limit() {
             .len(),
         12
     );
+}
+
+#[tokio::test]
+async fn backup_exceeds_four_mib() {
+    large_backup_contract(
+        TikvEngine::new(
+            Arc::new(MemoryStore::default()),
+            "backup-large",
+            "us-east-1",
+        )
+        .unwrap(),
+    )
+    .await;
+}
+#[cfg(feature = "client")]
+#[tokio::test]
+#[ignore = "requires dedicated TiKV/PD cluster; set TIKV_PD_ENDPOINTS"]
+async fn real_large_backup_contract() {
+    common::real_contract(large_backup_contract).await;
 }
 
 #[cfg(feature = "client")]

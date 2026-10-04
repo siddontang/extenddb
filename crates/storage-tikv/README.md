@@ -75,14 +75,16 @@ fence requests holding cached key information.
 
 The key order favors contiguous partition queries. A single hot item or stream
 shard still contends, and this backend has no claim of improved throughput until
-workload benchmarks establish it. Large administrative scans currently collect
-bounded network pages into memory; they are not an unlimited-size backup API.
+workload benchmarks establish it. Large administrative scans still materialize
+whole logical collections from bounded network pages. Backup and restore use
+the separate streaming snapshot modules described below.
 
 ## Complete backend modules
 
 | Module | Contract and validation |
 |---|---|
-| `catalog` | Atomic per-account IAM aggregate, global credential locators and 4 MiB limit; IAM/namespace contracts |
+| `catalog` | Account-fenced IAM transactions and global credential locators; IAM/namespace contracts |
+| `catalog::records` | Independent principal/policy/key/membership/session records, snapshot projections and lazy v1 migration; >4 MiB accounts and failed-migration rollback |
 | `catalog::management` | Users, groups, roles, inline policies, boundaries, keys, sessions; ownership, dependency and rollback assertions |
 | `catalog::crypto` | AES-256-GCM with access-key ID as authenticated context; tampering, wrong ID/key and truncation tests |
 | `catalog::credentials` | Snapshot credential resolution and expiry; deletion/revocation and temporary credential contracts |
@@ -91,7 +93,8 @@ bounded network pages into memory; they are not an unlimited-size backup API.
 | `ttl` / `metadata` | Numeric TTL generation and resource tags; decimal/ancient TTL, replacement and tag contracts |
 | `statistics` | Read-only snapshots and generation-fenced publication; no scan-plus-write commits, recreation and schema-change tests |
 | `maintenance` | Bounded, resumable lifecycle/backfill/deletion and expiry steps; 130-row multi-batch builds interleaved with mutations |
-| `backup` | Atomic chunked backup/restore with a 90 MiB encoded bound; missing-chunk rollback, legacy snapshots, account-generation scoping, rebuilt indexes and duplicate-target tests |
+| `backup` | Streaming snapshot backup and atomic restore publication; >4 MiB roundtrip, snapshot interleavings, missing-chunk failure, account scoping and rebuilt indexes |
+| `pitr` | Timestamp selection, renewable history retention and historical recovery; old/current images, GC-window loss, re-enable isolation, unknown enablement and source/target IAM tests |
 | `bootstrap` | Namespace reservation, atomic schema seed, encryption/admin/default-account initialization; repeated bootstrap and scoped destroy tests |
 | `backend` | Factory composition and CLI configuration; override/conflict test and real init/serve/verify workflow |
 | `runtime` | Scheduling and graceful shutdown only; single-step engine methods hold behavior, exercised by lifecycle contracts and CLI tests |
@@ -165,13 +168,15 @@ the reference MVCC store and real TiKV.
 
 * This is an experimental backend, not a PostgreSQL-to-TiKV migration tool. An
   existing PostgreSQL catalog/data set is not automatically copied or converted.
-* Vector search/indexes and point-in-time recovery are explicitly unsupported.
-  On-demand backups use a manifest and roughly 1 MiB chunks committed from one
-  snapshot. The encoded snapshot limit is 90 MiB; larger backups fail before
-  publication. Restore commits the table, items and rebuilt indexes together.
-  TiKV transaction-size limits also apply, particularly with index projections;
-  this is not an unbounded backup API. Legacy inline snapshots remain readable.
-  IAM documents have a separate 4 MiB per-account limit.
+* Vector indexes use exact partition scans with synchronous maintenance; no ANN
+  acceleration is claimed. On-demand backups stream without a table-size cap.
+  IAM has no aggregate account-size cap; each physical record is limited to 4 MiB.
+* PITR restores historical data from a currently existing source table. It keeps
+  up to 35 days while the retention worker is healthy. The 24-hour PD lease can
+  expire during extended downtime; the reported window then narrows to surviving
+  history. Deleted-table recovery, SourceTableArn and schema/capacity overrides
+  are not supported. Backups/history in the same cluster do not protect against
+  losing the cluster.
 * Table statistics are observed in a read-only MVCC snapshot, then published in
   a small transaction fenced by table id and schema generation. They are
   approximate under concurrent item writes. This avoids locking every scanned
@@ -211,3 +216,136 @@ snapshot. A multi-item write acquires its slots in sorted order. These gates
 reduce retry storms within one server; they do not provide distributed locking.
 TiKV conflict checks remain authoritative across processes, and a bounded retry
 budget can still return a conflict under sustained cross-instance contention.
+
+## Vector module
+
+`vector` owns physical row keys, synchronous maintenance and snapshot search.
+`vector::score` owns f64 distance calculations and bounded top-k ranking.
+`vector::build` implements the shared `VectorIndexBuild` primitives and driver.
+It persists progress per batch, serializes workers through the table document,
+and protects base-row reads against concurrent updates/deletes. This provides
+the shared lifecycle's write ordering without a deferred propagation queue.
+CreateTable indexes start active; UpdateTable indexes progress from CREATING
+through backfilling to ACTIVE. A failed batch leaves the index unpublished and
+a restarted worker resumes its cursor. Dropped generations cannot be revived.
+
+All three distance functions, HASH partitions, inline equality filters and
+projection use the existing engine contracts. Search scans 64 rows at a time
+in one MVCC snapshot and retains only top-k plus one page; read-only scans do
+not accumulate commit dependencies. CPU/network cost grows with the selected
+partition. Backups restore independent vector generations and rebuilt rows.
+`vector_contract` runs identically against memory and real TiKV; scoring tests
+cover zero, tiny, extreme, negative and tied scores.
+
+## IAM record layout (catalog schema 2)
+
+IAM management still computes a logical account transformation in memory, then
+writes only changed independent records. A protected account header serializes
+mutations and account deletion, keeping membership and global access-key
+uniqueness atomic without storing one account-sized value. Authorization uses
+principal prefixes, reverse membership and session-name indexes; normal data
+writes do not acquire the IAM fence. Per-record bounds remain 4 MiB, comfortably
+above public policy/tag limits. Large management operations still cost O(account
+size) memory/CPU, and exceptionally large deletions can meet TiKV's transaction
+limits; this is not a claim of unlimited management throughput.
+
+Stop all servers using the namespace, run `extenddb migrate --config ...`, then
+start the new binary. Schema 2 accepts legacy inline account documents and
+converts each on its next successful management edit. The conversion and edit
+commit together. Older binaries reject the schema version; do not bypass that
+check or run mixed-version writers. Keep a deployment backup before upgrade;
+downgrading requires restoring it, since old binaries cannot read normalized
+records. Account generation prefixes and bounded garbage collection prevent
+identity reuse from exposing retired IAM data.
+
+## Bulk snapshot modules (catalog schema 3)
+
+`backup::snapshot` keeps one owned MVCC snapshot, scanning eight source items
+per network page. `backup` stores immutable per-item chunks and publishes a
+small manifest after all chunks succeed. `backup::restore` rebuilds an
+unreachable table UUID, one source item and its indexes per transaction, then
+atomically installs its name and schema guards. Thus neither total table size
+nor total backup size is constrained to one TiKV value or transaction. Individual
+items still obey the normal DynamoDB size limit. Existing inline backups and
+pre-merge array-chunk manifests remain readable. Legacy chunks are streamed one
+array at a time and their total item count is checked before publication; missing
+or inconsistent chunks fail without exposing a target. Deletion queues either
+chunk layout for bounded cleanup. Catalog migration prevents older binaries
+misreading new backups. Publication retains the normal CREATING-to-ACTIVE
+transition, with all rows and indexes already complete before the name appears.
+
+`staging` protects unpublished prefixes with five-minute leases refreshed on
+every write batch. Expired/cancelled work is queued for bounded reclamation.
+Publication and removal of the staging job commit together. Cleanup cannot
+reclaim a successful publication even if its commit response was lost. A failed
+job must be requested again; it is not resumed at a different snapshot.
+
+`kv::gc` holds a PD service safepoint at snapshot timestamp minus one, renews
+before reading further pages, and releases on drop (or expires after five
+minutes after process loss). Transport failure, expired leases and already-GCed
+history abort rather than substitute fresh reads. The narrow protobuf projection
+implements GetMembers, GetGCSafePoint and UpdateServiceGCSafePoint with the same
+TLS configuration as client-rust, validating cluster identity and PD errors.
+It never advances the cluster GC safepoint. Your external GC controller must
+honor PD service safepoints. These protect logical snapshots, not cluster-loss
+recovery: backup data lives in the same TiKV cluster.
+
+Contracts cover >4 MiB tables on both stores, mutation between snapshot pages,
+atomic target visibility, missing chunks, expired staging leases and unknown
+publication outcomes. GC tests reject expired history, renewal failures and
+wrong-cluster responses. Signed HTTP tests verify the complete large-table
+backup/restore workflow. Backup and restore run synchronously; very large tables
+can exceed client/proxy request timeouts even though storage memory is bounded.
+
+## Point-in-time recovery (catalog schema 4)
+
+`pitr` separates durable enablement/retention state, pure recovery-time selection,
+worker reconciliation and restore orchestration. The `Store` boundary supplies
+TSO timestamps, historical snapshots and named GC barriers; its default methods
+refuse unsupported capabilities. The reference store retains test-only history
+when a retention barrier exists, with explicit time advancement and GC injection.
+`BackupEngine::restore_table_at(RestorePoint)` exposes the time to storage;
+backends without historical recovery keep the default refusal. The wire handler
+validates the time choice before dispatch and invalidates the restored name's
+cache only after success. No fallback to present-day data exists.
+
+Enabling registers a provisional five-minute PD lease before committing a new
+recovery generation, then extends it to 24 hours. Unknown enablement commits can
+be reconciled by the worker. A separate worker renews a page of at most 64 table
+leases each minute, independently of GSI/vector/TTL work. Barriers advance no
+further than the enabled timestamp or the 35-day cutoff, whichever is newer.
+The worker continues other entries after a renewal failure and reports that
+failure. Monitor renewal errors; sufficiently many tables or slow/unavailable PD
+can exhaust the lease interval. An abandoned provisional lease expires within
+five minutes; a stopped server's established lease expires within 24 hours.
+
+Disabling invalidates recovery immediately and removes its barrier, retrying
+cleanup in the worker when PD is unavailable. Re-enabling starts a new generation
+and window. Source deletion and namespace destruction release the corresponding
+barriers. A stale in-flight renewal may outlive disable briefly; its unique
+service identity cannot affect a re-enabled generation and expires within the
+lease interval. The external GC controller **must honor PD service safepoints**.
+These barriers hold back GC for the shared cluster, so 35-day retention can
+increase cluster-wide MVCC disk usage, even for other namespaces.
+
+Recovery reads committed historical base items in one GC-protected snapshot and
+uses the source's current table/index settings. Scalar indexes are rebuilt;
+pre-existing values invalid under a newer index schema are omitted from that
+index using the online-build rules, while their base items are preserved. Vector
+indexes use the same omission/validation helpers. TTL, streams, deletion
+protection, tags and PITR are not enabled on the restored table. Publication uses
+the same isolated-generation writer as on-demand restore.
+
+`RestoreDateTime` selects the end of its physical millisecond (capped at the
+current TSO for the current millisecond); `UseLatestRestorableTime=true` selects
+the current TSO. Specify exactly one. Future, disabled or collected timestamps
+are rejected. Only the fixed 35-day recovery period is implemented; other
+`RecoveryPeriodInDays` values and restore overrides are explicitly refused.
+Authorization checks restore permission on the source and read/write permissions
+on the target, following the [AWS backup/restore IAM guide](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/backuprestore_IAM.html).
+
+Upgrade with every namespace writer stopped, run `extenddb migrate --config ...`
+to schema 4, and restart the new binary. Schemas 1–3 are accepted as migration
+sources. Keep a deployment backup before upgrade; mixed-version writing and
+in-place downgrade are unsupported. The retained window is operational recovery,
+not an independent disaster-recovery copy or a PostgreSQL data migration.

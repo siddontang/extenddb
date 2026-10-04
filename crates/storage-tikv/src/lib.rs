@@ -13,8 +13,10 @@
 pub mod backend;
 pub mod backup;
 pub mod bootstrap;
+pub mod pitr;
 #[cfg(feature = "client")]
 mod runtime;
+mod staging;
 #[cfg(feature = "client")]
 pub use backend::backend;
 pub mod catalog;
@@ -31,4 +33,5 @@ mod statistics;
 pub mod stream;
 pub mod table;
 pub mod ttl;
+pub mod vector;
 pub use engine::TikvEngine;

@@ -239,6 +239,25 @@ fn batch_transact_authz_targets(operation: &str, input: &Value) -> Option<Vec<(S
         }
     };
     match operation {
+        "RestoreTableToPointInTime" => {
+            // Both names affect authorization. A source-specific deny must not
+            // disappear because restore has no top-level TableName field.
+            push(operation, input.get("SourceTableName")?.as_str()?);
+            let target = input.get("TargetTableName")?.as_str()?;
+            // AWS backup/restore IAM guidance requires restore permission on
+            // the source and read/write permissions on the target.
+            for action in [
+                "PutItem",
+                "UpdateItem",
+                "DeleteItem",
+                "GetItem",
+                "Query",
+                "Scan",
+                "BatchWriteItem",
+            ] {
+                push(action, target);
+            }
+        }
         "BatchGetItem" | "BatchWriteItem" => {
             // RequestItems is a map keyed by table name.
             let items = input.get("RequestItems")?.as_object()?;
@@ -298,6 +317,25 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn pitr_authorizes_both_source_and_target() {
+        assert_eq!(
+            batch_transact_authz_targets(
+                "RestoreTableToPointInTime",
+                &json!({"SourceTableName":"source","TargetTableName":"target"})
+            ),
+            Some(vec![
+                ("RestoreTableToPointInTime".into(), "source".into()),
+                ("PutItem".into(), "target".into()),
+                ("UpdateItem".into(), "target".into()),
+                ("DeleteItem".into(), "target".into()),
+                ("GetItem".into(), "target".into()),
+                ("Query".into(), "target".into()),
+                ("Scan".into(), "target".into()),
+                ("BatchWriteItem".into(), "target".into())
+            ])
+        );
+    }
     #[test]
     fn extract_attributes_resolves_expression_attribute_names() {
         let input = json!({

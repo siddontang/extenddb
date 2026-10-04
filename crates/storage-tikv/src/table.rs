@@ -26,6 +26,8 @@ pub struct Table {
     pub fence_generation: u64,
     pub description: TableDescription,
     pub indexes: Vec<Index>,
+    #[serde(default)]
+    pub vectors: Vec<crate::vector::VectorIndex>,
     pub transition_at: i64,
     pub ttl_attribute: Option<String>,
     pub ttl_ready: bool,
@@ -58,7 +60,11 @@ impl Table {
                 .map(Index::info)
                 .collect(),
             stream_specification: d.stream_specification.clone(),
-            vector_indexes: vec![],
+            vector_indexes: self
+                .vectors
+                .iter()
+                .map(crate::vector::VectorIndex::key_info)
+                .collect(),
         }
     }
     pub fn describe(&self) -> TableDescription {
@@ -96,6 +102,12 @@ impl Table {
                 index_arn: format!("{}/index/{}", d.table_arn, i.name),
             })
             .collect();
+        d.vector_indexes = (!self.vectors.is_empty()).then(|| {
+            self.vectors
+                .iter()
+                .map(|v| v.describe(&d.table_arn))
+                .collect()
+        });
         d.global_secondary_indexes = (!gsis.is_empty()).then_some(gsis);
         d.local_secondary_indexes = (!lsis.is_empty()).then_some(lsis);
         // Provisioned mode stays in the internal catalog, but DynamoDB omits
@@ -215,9 +227,6 @@ impl TableEngine for TikvEngine {
                 .run(|tx| {
                     let (e, a, input) = (engine.clone(), account.clone(), input.clone());
                     Box::pin(async move {
-                        if input.vector_indexes.as_ref().is_some_and(|v| !v.is_empty()) {
-                            return Err(StorageError::Unsupported("Vector indexes".into()));
-                        }
                         if kv::get::<crate::catalog::Account>(tx, e.key(&["account", &a]))
                             .await?
                             .is_none()
@@ -300,6 +309,12 @@ impl TableEngine for TikvEngine {
                             fence_generation: 0,
                             description,
                             indexes,
+                            vectors: input
+                                .vector_indexes
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|v| crate::vector::VectorIndex::new(v, false))
+                                .collect::<Result<_, _>>()?,
                             transition_at: now + delay,
                             ttl_attribute: None,
                             ttl_ready: false,
@@ -480,17 +495,43 @@ impl TableEngine for TikvEngine {
                     if t.description.table_status != TableStatus::Active {
                         return Err(StorageError::TableNotActive(input.table_name));
                     }
-                    if input
-                        .vector_index_updates
-                        .as_ref()
-                        .is_some_and(|v| !v.is_empty())
-                    {
-                        return Err(StorageError::Unsupported("Vector indexes".into()));
+                    validate_billing_update(&t.description, &input)?;
+                    for update in input.vector_index_updates.unwrap_or_default() {
+                        if let Some(spec) = update.create {
+                            if t.vectors
+                                .iter()
+                                .any(|v| v.spec.index_name == spec.index_name)
+                                || t.indexes.iter().any(|v| v.name == spec.index_name)
+                            {
+                                return Err(StorageError::IndexAlreadyExists(spec.index_name));
+                            }
+                            t.vectors.push(crate::vector::VectorIndex::new(spec, true)?);
+                        }
+                        if let Some(delete) = update.delete {
+                            let pos = t
+                                .vectors
+                                .iter()
+                                .position(|v| v.spec.index_name == delete.index_name)
+                                .ok_or_else(|| {
+                                    StorageError::IndexNotFound(delete.index_name.clone())
+                                })?;
+                            if t.vectors[pos].backfilling == Some(false) {
+                                return Err(StorageError::IndexesInUse(
+                                    "Cannot delete vector index before backfill starts".into(),
+                                ));
+                            }
+                            let removed = t.vectors.remove(pos);
+                            kv::put(
+                                tx,
+                                e.key(&["garbage", &t.description.table_id, &removed.id]),
+                                &crate::vector::prefix(&e, &t.description.table_id, &removed.id),
+                            )
+                            .await?;
+                        }
                     }
                     if let Some(v) = input.deletion_protection_enabled {
                         t.description.deletion_protection_enabled = v;
                     }
-                    validate_billing_update(&t.description, &input)?;
                     if let Some(v) = input.billing_mode {
                         t.description.billing_mode_summary = Some(BillingModeSummary {
                             billing_mode: v,
@@ -548,11 +589,22 @@ impl TableEngine for TikvEngine {
                             .await?;
                         }
                     }
-                    let schemas: Vec<_> = t.indexes.iter().map(|i| i.schema.clone()).collect();
+                    let mut schemas: Vec<_> = t.indexes.iter().map(|i| i.schema.clone()).collect();
+                    schemas.extend(t.vectors.iter().map(|v| {
+                        v.spec
+                            .search_schema
+                            .iter()
+                            .flatten()
+                            .map(|s| KeySchemaElement {
+                                attribute_name: s.attribute_name.clone(),
+                                key_type: KeyType::Hash,
+                            })
+                            .collect()
+                    }));
                     t.description.attribute_definitions =
                         extenddb_storage::util::effective_attribute_definitions(
                             &t.description.attribute_definitions,
-                            &input.attribute_definitions.unwrap_or_default(),
+                            &input.attribute_definitions.clone().unwrap_or_default(),
                             &t.description.key_schema,
                             &schemas,
                         );
@@ -617,6 +669,10 @@ fn schema_fingerprint(t: &Table) -> Result<Vec<u8>, StorageError> {
         &t.description.latest_stream_arn,
         &t.ttl_attribute,
         &t.ttl_generation,
+        t.vectors
+            .iter()
+            .map(|v| (&v.id, &v.spec))
+            .collect::<Vec<_>>(),
         t.indexes
             .iter()
             .map(|i| (&i.id, &i.name, &i.schema, &i.projection))

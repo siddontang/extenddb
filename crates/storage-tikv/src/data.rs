@@ -145,6 +145,19 @@ impl TikvEngine {
             }
         };
         if let Some(item) = &new {
+            let empty = Item::new();
+            let before = if matches!(op.change, Change::Update(_)) {
+                old.as_ref().unwrap_or(&empty)
+            } else {
+                &empty
+            };
+            validation::validate_vector_write_changed(
+                item,
+                before,
+                &info.vector_indexes,
+                &info.attribute_definitions,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
             let validate_size = if matches!(op.change, Change::Update(_)) {
                 validation::validate_update_item_size
             } else {
@@ -184,6 +197,9 @@ impl TikvEngine {
                 new.as_ref(),
             )
             .await?;
+        }
+        for vector in &table.vectors {
+            crate::vector::apply(self, tx, &table, vector, old.as_ref(), new.as_ref()).await?;
         }
         crate::ttl::apply(self, tx, &table, old.as_ref(), new.as_ref()).await?;
         if old != new {
@@ -226,6 +242,9 @@ fn mutation(
 }
 
 impl DataEngine for TikvEngine {
+    fn as_vector_search(&self) -> Option<&dyn extenddb_storage::VectorSearchEngine> {
+        Some(self)
+    }
     fn put_item(
         &self,
         info: &TableKeyInfo,

@@ -10,7 +10,7 @@ description = "Modular transactional TiKV backend for ExtendDB"
 
 [features]
 default = []
-client = ["dep:tikv-client"]
+client = ["dep:tikv-client", "dep:tonic", "dep:prost"]
 test-support = []
 
 [dependencies]
@@ -34,6 +34,9 @@ bcrypt.workspace = true
 aes-gcm.workspace = true
 zeroize.workspace = true
 tikv-client = { version = "=0.4.0", optional = true, default-features = false }
+
+tonic = { version = "0.10", optional = true, features = ["tls"] }
+prost = { version = "0.12", optional = true }
 
 [dev-dependencies]
 proptest = "1"

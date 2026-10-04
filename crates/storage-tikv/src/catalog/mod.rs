@@ -3,18 +3,17 @@
 
 //! Transactional catalog independent of transport and HTTP handlers.
 //!
-//! IAM is a bounded per-account aggregate: all membership, policy, key and
-//! session invariants serialize on one protected account document. This favors
-//! correctness and auditability over high IAM write throughput. Data-plane
-//! writes do not update the aggregate. Global credential locators are maintained
-//! in the same transaction and never expose secret material. Aggregates have a
-//! 4 MiB encoded limit; exceeding it fails without changing any key.
+//! IAM mutations use a protected account header and independently stored records.
+//! Pure management transformations operate on a snapshot and persist only their
+//! changed records. Authorization reads just the relevant principal/session.
+//! See `records` for layout migration and transaction invariants.
 
 pub mod authorization;
 pub mod credentials;
 pub mod crypto;
 pub mod management;
 pub mod operational;
+mod records;
 
 use crate::{TikvEngine, kv};
 use extenddb_storage::{error::StorageError, management_store::*};
@@ -34,6 +33,8 @@ pub struct TikvCatalog {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Account {
+    #[serde(default = "legacy_layout")]
+    pub layout: u8,
     pub id: String,
     #[serde(default)]
     pub generation: String,
@@ -93,9 +94,13 @@ pub(crate) fn arn(id: &str, kind: &str, name: &str) -> String {
 pub(crate) fn pairs(m: &BTreeMap<String, String>) -> Vec<(String, String)> {
     m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
+fn legacy_layout() -> u8 {
+    1
+}
 impl Account {
     pub(crate) fn new(id: String, name: String, created: OffsetDateTime) -> Self {
         Self {
+            layout: 2,
             id,
             generation: uuid::Uuid::new_v4().to_string(),
             name,
@@ -198,15 +203,47 @@ impl TikvCatalog {
         f: impl Fn(Option<Account>) -> OpResult<R> + Send + Sync + 'static,
     ) -> OpResult<R> {
         let e = self.engine.clone();
-        let key = e.key(&["account", id]);
+        let id = id.to_owned();
         let f = Arc::new(f);
-        e.db.run(move |tx| {
-            let key = key.clone();
-            let f = f.clone();
-            Box::pin(async move { Ok(f(kv::get(tx, key).await?)) })
-        })
-        .await
-        .map_err(op_error)?
+        e.db.clone()
+            .run(move |tx| {
+                let e = e.clone();
+                let id = id.clone();
+                let f = f.clone();
+                Box::pin(async move { Ok(f(records::load(&e, tx, &id).await?)) })
+            })
+            .await
+            .map_err(op_error)?
+    }
+    pub(crate) async fn read_principal<R: Send + 'static>(
+        &self,
+        id: &str,
+        kind: &'static str,
+        name: &str,
+        f: impl Fn(Option<Principal>) -> OpResult<R> + Send + Sync + 'static,
+    ) -> OpResult<R> {
+        let e = self.engine.clone();
+        let id = id.to_owned();
+        let name = name.to_owned();
+        let f = Arc::new(f);
+        e.db.clone()
+            .run(move |tx| {
+                let e = e.clone();
+                let id = id.clone();
+                let name = name.clone();
+                let f = f.clone();
+                Box::pin(async move {
+                    let p =
+                        if let Some(a) = kv::get::<Account>(tx, e.key(&["account", &id])).await? {
+                            records::principal(&e, tx, &a, kind, &name).await?
+                        } else {
+                            None
+                        };
+                    Ok(f(p))
+                })
+            })
+            .await
+            .map_err(op_error)?
     }
     pub(crate) async fn edit<R: Send + 'static>(
         &self,
@@ -214,29 +251,23 @@ impl TikvCatalog {
         f: impl Fn(&mut Account) -> OpResult<R> + Send + Sync + 'static,
     ) -> OpResult<R> {
         let e = self.engine.clone();
-        let key = e.key(&["account", id]);
+        let id = id.to_owned();
         let f = Arc::new(f);
         e.db.clone()
             .run(move |tx| {
-                let key = key.clone();
+                let id = id.clone();
                 let f = f.clone();
                 let e = e.clone();
                 Box::pin(async move {
-                    let Some(mut account) = kv::get::<Account>(tx, key.clone()).await? else {
+                    let Some(mut account) = records::load(&e, tx, &id).await? else {
                         return Ok(Err(missing("Account")));
                     };
+                    let original = account.clone();
                     let before = account.locators();
                     let result = match f(&mut account) {
                         Ok(v) => v,
                         Err(e) => return Ok(Err(e)),
                     };
-                    let bytes = serde_json::to_vec(&account)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if bytes.len() > 4 * 1024 * 1024 {
-                        return Ok(Err(OpError::Validation(
-                            "TiKV IAM account exceeds 4 MiB catalog limit".into(),
-                        )));
-                    }
                     let after = account.locators();
                     // Validate every absent locator before staging any mutation.
                     for (id, locator) in &after {
@@ -256,7 +287,7 @@ impl TikvCatalog {
                             kv::put(tx, e.key(&["credential", id]), locator).await?;
                         }
                     }
-                    tx.put(key, bytes).await.map_err(kv::storage_error)?;
+                    records::save(&e, tx, &original, &account).await?;
                     Ok(Ok(result))
                 })
             })
